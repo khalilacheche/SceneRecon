@@ -50,10 +50,17 @@ if __name__ == "__main__":
 
     model = fine_recon.FineRecon(config)
 
-    logger = pl.loggers.TensorBoardLogger(save_dir=".", version=config.run_name)
+    #logger = pl.loggers.TensorBoardLogger(save_dir=".", version=config.run_name)
+    logger = pl.loggers.WandbLogger(
+        entity="khalil-acheche",
+        project="SceneRecon",
+        name=config.run_name,
+        save_dir=".",
+        log_model="all",
+    )
     logger.experiment
 
-    zip_code(logger.experiment.log_dir)
+    zip_code(logger.save_dir)
 
     trainer = pl.Trainer(
         logger=logger,

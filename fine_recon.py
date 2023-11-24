@@ -238,7 +238,7 @@ class FineRecon(pl.LightningModule):
             K[:, :, 0] *= featwidth / imwidth
             K[:, :, 1] *= featheight / imheight
             with torch.autocast(enabled=False, device_type=self.device.type):
-                xyz_cam = (torch.inverse(poses) @ xyz)[:, :, :3]
+                xyz_cam = (torch.inverse(poses).float() @ xyz.float())[:, :, :3]
                 uv = K @ xyz_cam
             uv = uv[:, :, :2] / uv[:, :, 2:]
 
@@ -540,7 +540,7 @@ class FineRecon(pl.LightningModule):
                 if k in self.transfer_keys:
                     batch[k] = batch[k].to(self.device)
             self.predict_step(batch, i)
-        self.predict_cleanup()
+        #self.predict_cleanup()
         torch.cuda.empty_cache()
 
     def predict_cleanup(self):
@@ -1028,7 +1028,7 @@ class FineRecon(pl.LightningModule):
             self.final_step_time += t1 - t0
             self.n_final_steps += 1
 
-        os.makedirs(self.logger.log_dir, exist_ok=True)
+        os.makedirs(self.logger.save_dir, exist_ok=True)
         name = batch["scan_name"][0]
         step = str(self.global_step).zfill(8)
 
@@ -1048,7 +1048,7 @@ class FineRecon(pl.LightningModule):
         except Exception as e:
             print(e)
         else:
-            _ = pred_mesh.export(os.path.join(self.logger.log_dir, f"{name}.ply"))
+            _ = pred_mesh.export(os.path.join(self.logger.save_dir, f"{name}.ply"))
 
     def predict_step(self, batch, batch_idx):
         if batch["initial_frame"][0]:
@@ -1143,6 +1143,7 @@ class FineRecon(pl.LightningModule):
             random_view_selection=True,
             image_augmentation=True,
             load_depth=self.dg.enabled,
+            keyframes_file =self.config.test_keyframes_file,
         )
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
@@ -1151,6 +1152,8 @@ class FineRecon(pl.LightningModule):
             persistent_workers=self.config.workers_train > 0,
             shuffle=True,
             drop_last=True,
+            
+
         )
         return train_loader
 
@@ -1165,6 +1168,7 @@ class FineRecon(pl.LightningModule):
             random_translation=True,
             random_rotation=True,
             load_depth=self.dg.enabled,
+            keyframes_file = self.config.test_keyframes_file
         )
 
         val_loader = torch.utils.data.DataLoader(

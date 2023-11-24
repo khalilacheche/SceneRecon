@@ -55,7 +55,9 @@ def get_scans(dataset_dir, tsdf_dir, pred_depth_dir):
             elif scan_name in test_scan_names:
                 test_scans.append(scan)
             else:
-                raise Exception()
+                pass
+                #print("skipping",scan_name)
+                #raise Exception()
 
     return train_scans, val_scans, test_scans
 
@@ -97,6 +99,7 @@ def load_scan(scan, keyframes_file=None):
     if keyframes_file is not None:
         with open(keyframes_file, "r") as f:
             kf_idxs = np.array(json.load(f)[scan["scan_name"]])
+            
         frames = {i: frames[i] for i in kf_idxs}
 
     kf_idx = np.ones(len(frames))
@@ -459,6 +462,8 @@ class Dataset(torch.utils.data.Dataset):
         random_view_selection=False,
         image_augmentation=False,
         load_depth=False,
+        keyframes_file=None
+
     ):
         self.scans = scans
         self.n_views = n_views
@@ -470,6 +475,7 @@ class Dataset(torch.utils.data.Dataset):
         self.random_view_selection = random_view_selection
         self.image_augmentation = image_augmentation
         self.load_depth = load_depth
+        self.keyframes_file = keyframes_file
 
     def __len__(self):
         return len(self.scans)
@@ -485,7 +491,7 @@ class Dataset(torch.utils.data.Dataset):
             K_color,
             K_gt_depth,
             kf_idx,
-        ) = load_scan(scan)
+        ) = load_scan(scan,self.keyframes_file)
 
         tsdf_npzfile = scan["tsdf_npzfile"]
         npz = np.load(tsdf_npzfile)
@@ -494,6 +500,7 @@ class Dataset(torch.utils.data.Dataset):
         gt_origin = torch.from_numpy(npz["origin"])
         gt_voxel_size = np.float32(npz["voxel_size"])
         gt_maxbound = torch.from_numpy(npz["maxbound"])
+
 
         crop_size_m = self.crop_voxel_size * self.crop_size_nvox
         if self.random_translation:

@@ -35,7 +35,7 @@ def project(xyz, poses, K, imsize):
     xyz = torch.cat((xyz, torch.ones_like(xyz[:, :, :1])), dim=2)
 
     with torch.autocast(enabled=False, device_type=device.type):
-        xyz_cam = (torch.inverse(poses) @ xyz)[:, :, :3]
+        xyz_cam = (torch.inverse(poses).float() @ xyz.float())[:, :, :3]
         uv = K @ xyz_cam
 
     z = uv[:, :, 2]

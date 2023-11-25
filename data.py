@@ -241,11 +241,24 @@ def augment_images_inplace(rgb_imgs):
 def load_depth_img(f):
     return cv2.imread(f, cv2.IMREAD_ANYDEPTH).astype(np.float32) / 1000
 
+def load_normal_img(f):
+    img = cv2.imread(f)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    normal = img / 255.0
+    normal = normal * 2 - 1
+    return -normal
+
 
 def load_depth_imgs(depth_imgfiles, imsize):
     result = np.zeros((len(depth_imgfiles), *imsize), dtype=np.float32)
     for i in range(len(depth_imgfiles)):
         result[i] = load_depth_img(depth_imgfiles[i])
+    return torch.from_numpy(result)
+
+def load_normal_imgs(normal_imgfiles,imgsize):
+    result = np.zeros((len(normal_imgfiles), *imsize), dtype=np.float32)
+    for i in range(len(normal_imgfiles)):
+        result[i] = load_normal_img(normal_imgfiles[i])
     return torch.from_numpy(result)
 
 
@@ -288,9 +301,10 @@ def reflect_pose(pose, plane_pt=None, plane_normal=None):
 
 
 class InferenceDataset(torch.utils.data.Dataset):
-    def __init__(self, scans, load_depth=False, keyframes_file=None):
+    def __init__(self, scans, load_depth=False, load_normals= False,keyframes_file=None):
         self.scans = scans
         self.load_depth = load_depth
+        self.load_normals = load_normals
 
         self.frames = []
         for scan in self.scans:
@@ -324,14 +338,31 @@ class InferenceDataset(torch.utils.data.Dataset):
                     pred_depth_imgfile = None
                     K_pred_depth = None
 
+                if load_normals:
+                    pred_normal_imgfile = os.path.join(
+                        scan["pred_depth_dir"],
+                        "normal",
+                        os.path.basename(rgb_imgfiles[i])[:-4] + ".png",
+                    )
+                    K_pred_normal = torch.from_numpy(
+                        np.loadtxt(
+                            os.path.join(scan["pred_depth_dir"], "intrinsic_depth.txt")
+                        )[:3, :3]
+                    ).float()
+                else:
+                    pred_normal_imgfile = None
+                    K_pred_normal = None
+
                 self.frames.append(
                     [
                         rgb_imgfiles[i],
                         gt_depth_imgfiles[i],
                         pred_depth_imgfile,
+                        pred_normal_imgfile,
                         poses[i],
                         K_color,
                         K_pred_depth,
+                        K_pred_normal,
                         scan["tsdf_npzfile"],
                         scan["scan_name"],
                         keyframe,
@@ -348,9 +379,11 @@ class InferenceDataset(torch.utils.data.Dataset):
             rgb_imgfile,
             gt_depth_imgfile,
             pred_depth_imgfile,
+            pred_normal_imgfile,
             pose,
             K_color,
             K_pred_depth,
+            K_pred_normal,
             tsdf_npzfile,
             scan_name,
             keyframe,
@@ -382,6 +415,11 @@ class InferenceDataset(torch.utils.data.Dataset):
 
             result["pred_depth_imgs"] = pred_depth_img
             result["K_pred_depth"] = K_pred_depth
+        if self.load_normals:
+            pred_normal_img = load_normal_img(pred_normal_imgfile)[None]
+
+            result["pred_normal_imgs"] = pred_normal_img
+            result["K_pred_normal"] = K_pred_normal
 
         return result
 
@@ -462,6 +500,7 @@ class Dataset(torch.utils.data.Dataset):
         random_view_selection=False,
         image_augmentation=False,
         load_depth=False,
+        load_normals=False,
         keyframes_file=None
 
     ):
@@ -475,6 +514,7 @@ class Dataset(torch.utils.data.Dataset):
         self.random_view_selection = random_view_selection
         self.image_augmentation = image_augmentation
         self.load_depth = load_depth
+        self.load_normals = load_normals
         self.keyframes_file = keyframes_file
 
     def __len__(self):
@@ -599,6 +639,28 @@ class Dataset(torch.utils.data.Dataset):
 
             result["K_pred_depth"] = K_pred_depth
             result["pred_depth_imgs"] = pred_depth_imgs
+        if self.load_normals:
+            pred_normals_imgfiles = []
+            for rgb_imgfile in rgb_imgfiles[view_inds]:
+                pred_normals_imgfiles.append(
+                    os.path.join(
+                        scan["pred_depth_dir"],
+                        "normal",
+                        os.path.basename(rgb_imgfile)[:-4] + ".png",
+                    )
+                )
+
+            pred_normal_img_shape = load_normal_img(pred_normals_imgfiles[0]).shape
+            pred_normal_imgs = load_normal_imgs(pred_normals_imgfiles, pred_normal_img_shape)
+
+            K_pred_normal = torch.from_numpy(
+                np.loadtxt(os.path.join(scan["pred_depth_dir"], "intrinsic_depth.txt"))[
+                    :3, :3
+                ]
+            ).float()
+
+            result["K_pred_normal"] = K_pred_normal
+            result["pred_normal_imgs"] = pred_normal_imgs
 
         result["poses"] = poses[view_inds]
         result["gt_tsdf_npzfile"] = tsdf_npzfile

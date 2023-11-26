@@ -116,18 +116,22 @@ class Cnn2d(torch.nn.Module):
 
 
 class FeatureFusion(torch.nn.Module):
-    def __init__(self, in_c):
+    def __init__(self, in_c,include_variance=False):
         super().__init__()
-        self.out_c = in_c
+        self.include_variance = include_variance
+        self.out_c = in_c if not include_variance else (2*in_c)
         self.bn = torch.nn.BatchNorm3d(self.out_c)
 
     def forward(self, x, valid):
         counts = torch.sum(valid, dim=1, keepdim=True)
-        counts.masked_fill_(counts == 0, 1)
         x.masked_fill_(~valid[:, :, None], 0)
-        x /= counts[:, :, None]
-        mean = x.sum(dim=1)
-
+        mean = x / counts[:, :, None]
+        mean = mean.sum(dim=1)
+        mean.masked_fill_(counts == 0, 0)
+        if self.include_variance:
+            var = ((x-mean[:,None])**2).sum(dim=1)/counts
+            var.masked_fill_(counts <= 1, 0)
+            return self.bn(torch.cat([mean,var],dim=1))
         return self.bn(mean)
 
 

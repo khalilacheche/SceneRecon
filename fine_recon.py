@@ -20,11 +20,13 @@ class FineRecon(pl.LightningModule):
 
         img_feature_dim = 47
         self.cnn2d = modules.Cnn2d(out_dim=img_feature_dim)
-        self.fusion = modules.FeatureFusion(in_c=img_feature_dim)
+        self.fusion = modules.FeatureFusion(in_c=img_feature_dim,include_variance=self.config.feature_volume.append_var)
         self.voxel_feat_dim = self.fusion.out_c
 
         # just a shorthand
         self.dg = self.config.depth_guidance
+
+        self.perform_point_backprojection = self.config.point_backprojection.enabled
 
         if self.dg.enabled:
             if self.dg.density_fusion_channel:
@@ -34,21 +36,21 @@ class FineRecon(pl.LightningModule):
 
         self.cnn3d = modules.Cnn3d(in_c=self.voxel_feat_dim)
 
-        if self.config.point_backprojection:
+        if self.perform_point_backprojection:
             self.cnn2d_pb_out_dim = img_feature_dim
             self.cnn2d_pb = modules.Cnn2d(out_dim=self.cnn2d_pb_out_dim)
+            self.point_fusion = modules.FeatureFusion(in_c=self.cnn2d_pb_out_dim,include_variance=self.config.point_backprojection.append_var)
             self.point_feat_mlp = torch.nn.Sequential(
-                modules.ResBlock1d(self.cnn2d_pb_out_dim),
-                modules.ResBlock1d(self.cnn2d_pb_out_dim),
+                modules.ResBlock1d(self.point_fusion.out_c),
+                modules.ResBlock1d(self.point_fusion.out_c),
             )
-            self.point_fusion = modules.FeatureFusion(in_c=self.cnn2d_pb_out_dim)
 
         surface_pred_input_dim = occ_pred_input_dim = self.cnn3d.out_c
-        if self.config.point_backprojection:
-            surface_pred_input_dim += self.cnn2d_pb_out_dim
+        if self.perform_point_backprojection:
+            surface_pred_input_dim += self.point_fusion.out_c
 
         if self.dg.enabled:
-            if self.config.point_backprojection:
+            if self.perform_point_backprojection:
                 if self.dg.density_fusion_channel:
                     surface_pred_input_dim += 1
                 elif self.dg.tsdf_fusion_channel:
@@ -406,7 +408,7 @@ class FineRecon(pl.LightningModule):
             coarse_point_feats = voxel_feats.view(*voxel_feats.shape[:2], -1)
             coarse_point_valid = voxel_valid.view(voxel_valid.shape[0], -1)
 
-        if self.config.point_backprojection:
+        if self.perform_point_backprojection:
             coords = batch["output_coords"]
 
             if self.dg.enabled:
@@ -479,7 +481,6 @@ class FineRecon(pl.LightningModule):
         else:
             fine_point_feats = coarse_point_feats
             fine_point_valid = coarse_point_valid
-
         tsdf_logits = self.surface_predictor(fine_point_feats).squeeze(1)
         occ_logits = self.occ_predictor(coarse_point_feats).squeeze(1)
 
@@ -540,7 +541,7 @@ class FineRecon(pl.LightningModule):
                 if k in self.transfer_keys:
                     batch[k] = batch[k].to(self.device)
             self.predict_step(batch, i)
-        #self.predict_cleanup()
+        self.predict_cleanup()
         torch.cuda.empty_cache()
 
     def predict_cleanup(self):
@@ -683,17 +684,45 @@ class FineRecon(pl.LightningModule):
         in get_img_voxel_feats_by_img_bp these values are already zeroed inside of utils.sample_voxel_feats
         zeroing again here just in case
         """
+        
         img_voxel_feats.masked_fill_(~img_voxel_valid[:, :, None], 0)
 
         old_count = self.running_count[valid].clone()
         self.running_count[valid] += img_voxel_valid[0, 0, 0, 0]
         new_count = self.running_count[valid]
-
         x = img_voxel_feats[0, 0, :, 0, 0]
-        old_m = self.M[:, valid]
-        new_m = x / new_count[None] + (old_count / new_count)[None] * old_m
-        self.M[:, valid] = new_m
-        self.M.masked_fill_(self.running_count[None] == 0, 0)
+        
+        if  self.config.feature_volume.append_var:
+            c = self.cnn2d_pb_out_dim  # Assuming the first half is mean, and the second is variance
+            valid_mean = self.M[:c, valid]
+            valid_var = self.M[c:, valid]
+
+            # Online mean calculation
+            new_mean = x / new_count[None] + (old_count / new_count)[None] * valid_mean
+            self.M[:c, valid] = new_mean
+
+            # Masking the invalid counts for mean
+            self.M[:c].masked_fill_(self.running_count[None] == 0, 0)
+
+            # Online variance calculation based on the updated mean
+            delta = x - new_mean
+            new_var = valid_var + delta * (x - new_mean - delta)
+            self.M[c:, valid] = new_var
+            if batch["final_frame"][0]:
+                # to get the true variance, we need to divide the var component of M by the running count in the last frame
+                # update variance part
+                self.M[c:, valid] = self.M[c:, valid]/self.running_count[valid]
+
+            # Masking the invalid counts for variance
+            self.M[c:].masked_fill_(self.running_count[None] <= 1, 0)
+
+            
+        else:
+                
+            old_m = self.M[:, valid]
+            new_m = x / new_count[None] + (old_count / new_count)[None] * old_m
+            self.M[:, valid] = new_m
+            self.M.masked_fill_(self.running_count[None] == 0, 0)
 
         if self.dg.enabled:
             if self.dg.density_fusion_channel:
@@ -727,6 +756,7 @@ class FineRecon(pl.LightningModule):
             t0 = time.time()
 
         global_feats = self.M
+
         global_feats = self.fusion.bn(global_feats[None]).squeeze(0)
 
         if self.config.no_image_features:
@@ -775,7 +805,7 @@ class FineRecon(pl.LightningModule):
 
         coarse_voxel_chunk_size = (2**20) // (self.config.output_sample_rate**3)
 
-        if self.config.point_backprojection:
+        if self.perform_point_backprojection:
             imheight, imwidth = self.keyframe_rgb[0].shape[1:]
             featheight = imheight // 4
             featwidth = imwidth // 4
@@ -844,13 +874,20 @@ class FineRecon(pl.LightningModule):
                 batch["gt_origin"],
             )
 
-            if self.config.point_backprojection:
-                img_feature_dim = self.M.shape[0]
-                fine_bp_feats = torch.zeros(
-                    (self.cnn2d_pb_out_dim, len(chunk_fine_coords)),
-                    device=self.device,
-                    dtype=self.M.dtype,
-                )
+            if self.perform_point_backprojection:
+                if self.config.point_backprojection.append_var:
+                    fine_bp_feats = torch.zeros(
+                        (self.cnn2d_pb_out_dim*2, len(chunk_fine_coords)),
+                        device=self.device,
+                        dtype=self.M.dtype,
+                    )
+                else:
+                    fine_bp_feats = torch.zeros(
+                        (self.cnn2d_pb_out_dim, len(chunk_fine_coords)),
+                        device=self.device,
+                        dtype=self.M.dtype,
+                    )
+                
                 counts = torch.zeros(
                     len(chunk_fine_coords), device=self.device, dtype=torch.float32
                 )
@@ -928,13 +965,40 @@ class FineRecon(pl.LightningModule):
                     old_counts = counts.clone()
                     current_counts = valid.squeeze(0).sum(dim=0)
                     counts += current_counts
-
+                     
+                    # masked fill for invalid points is not needed here, since it is done in utils.sample_voxel_feats
                     denom = torch.clamp_min(counts, 1)
-                    _fine_bp_feats = _fine_bp_feats.squeeze(0)
-                    _fine_bp_feats /= denom
-                    _fine_bp_feats = _fine_bp_feats.sum(dim=0)
-                    fine_bp_feats *= old_counts / denom
-                    fine_bp_feats += _fine_bp_feats
+
+                    if self.config.point_backprojection.append_var:
+                        c = self.cnn2d_pb_out_dim
+                        m = current_counts
+                        mean_m = _fine_bp_feats.squeeze(0).sum(dim=0)/m 
+                        mean_n = fine_bp_feats[:c]
+                        n = old_counts
+                        
+                        new_mean = ( mean_m * m /(m+n) ) + (mean_n * n/(m+n))
+                        new_mean.masked_fill_(current_counts == 0, 0)
+                        fine_bp_feats[:c] = new_mean
+
+                        
+                        var_m = ((_fine_bp_feats.squeeze(0)-mean_m)**2).sum(dim=0)/m
+                        var_n = fine_bp_feats[c:]
+
+                        
+                        new_var = ( m/(m+n) * (var_m + mean_m**2)) + (n/(m+n) * (var_n + mean_n**2)) - new_mean**2
+                        new_var.masked_fill_(current_counts <= 1, 0)
+                        fine_bp_feats[c:] = new_var
+
+                    else:
+                        _fine_bp_feats = _fine_bp_feats.squeeze(0)
+                        _fine_bp_feats /= denom
+                        _fine_bp_feats = _fine_bp_feats.sum(dim=0)
+                        _fine_bp_feats *= current_counts
+                        fine_bp_feats *= old_counts / denom
+                        fine_bp_feats += _fine_bp_feats
+
+
+                    
 
                     if self.dg.enabled:
                         if self.dg.density_fusion_channel:
@@ -1056,7 +1120,7 @@ class FineRecon(pl.LightningModule):
 
         self.predict_per_view(batch)
 
-        if self.config.point_backprojection:
+        if self.perform_point_backprojection:
             # store any frames that are marked as keyframes for later point back-projection
             if batch["keyframe"][0]:
                 self.keyframe_rgb.append(batch["rgb_imgs"][0, 0])

@@ -58,7 +58,9 @@ def get_scans(dataset_dir, tsdf_dir, pred_depth_dir):
                 pass
                 #print("skipping",scan_name)
                 #raise Exception()
-
+    # print("Train scans:",len(train_scans))
+    # print("Val scans:",len(val_scans))
+    # print("Test scans:",len(test_scans))
     return train_scans, val_scans, test_scans
 
 
@@ -575,6 +577,7 @@ class Dataset(torch.utils.data.Dataset):
 
         view_inds = select_views(crop_bounds, poses, K_color, TARGET_RGB_IMG_SIZE)
         if len(view_inds) < self.n_views:
+
             # not enough views made it past view selection
             # choose extras from among the views that were not selected
             all_view_inds = set(range(len(poses)))
@@ -584,15 +587,15 @@ class Dataset(torch.utils.data.Dataset):
             extra_view_inds = np.random.choice(
                 unused_view_inds, size=n_sample, replace=False
             )
-            view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds)))
+            view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).int()
 
             if len(view_inds) < self.n_views:
                 # still not enough. add duplicates
                 n_needed = self.n_views - len(view_inds)
                 extra_view_inds = np.random.choice(
-                    all_view_inds, size=n_needed, replace=False
+                    list(all_view_inds), size=n_needed, replace=True
                 )
-                view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds)))
+                view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).int()
 
         if self.random_view_selection:
             view_inds = np.random.choice(view_inds, size=self.n_views, replace=False)
@@ -610,6 +613,7 @@ class Dataset(torch.utils.data.Dataset):
             "gt_maxbound": gt_maxbound,
             "scan_name": scan["scan_name"],
         }
+
 
         rgb_imgs = load_rgb_imgs(rgb_imgfiles[view_inds], TARGET_RGB_IMG_SIZE)
         if self.image_augmentation:

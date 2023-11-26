@@ -1,7 +1,7 @@
-run_name: "baseline"
+run_name: "mean_var_600ts_batch1"
+offline_logging: False
 
 improved_tsdf_sampling: True
-point_backprojection: True
 
 depth_guidance:
   enabled: True
@@ -10,6 +10,18 @@ depth_guidance:
   bp_weighting: "none"
   tsdf_fusion_channel: True
   density_fusion_channel: False
+
+
+# Parameters
+feature_volume:
+  append_var: True 
+#  image_count: True # Add a channel in the feature volume containing the count of images for a voxel
+#  viewing_direction: True # Add channels for viewing direction (mean, var(optional if append_variance enabled)) 
+#  normal_direction: True # Add channels for normal direction (mean, var(optional if append_variance enabled)) 
+point_backprojection:
+  enabled: True
+  append_var: True
+
 
 output_sample_rate: 2
 reduce_lr_on_plateau: False
@@ -23,7 +35,7 @@ n_views_val: 20
 workers_train: 8
 workers_val: 8
 workers_predict: 8
-batch_size_per_device: 2
+batch_size_per_device: 1
 voxel_size: 0.04
 crop_size_nvox_train: [96, 96, 56]
 crop_size_nvox_val: [96, 96, 96]

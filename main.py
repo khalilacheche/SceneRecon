@@ -51,13 +51,22 @@ if __name__ == "__main__":
     model = fine_recon.FineRecon(config)
 
     #logger = pl.loggers.TensorBoardLogger(save_dir=".", version=config.run_name)
-    logger = pl.loggers.WandbLogger(
-        entity="khalil-acheche",
-        project="SceneRecon",
-        name=config.run_name,
-        save_dir=".",
-        log_model="all",
-    )
+    if config.offline_logging:
+        logger = pl.loggers.WandbLogger(
+            project="SceneRecon",
+            name=config.run_name,
+            save_dir="./save_dir",
+            offline = True
+        )
+    else:
+        logger = pl.loggers.WandbLogger(
+            entity="khalil-acheche",
+            project="SceneRecon",
+            name=config.run_name,
+            save_dir="./save_dir",
+            log_model="all",
+        )
+
     logger.experiment
 
     zip_code(logger.save_dir)

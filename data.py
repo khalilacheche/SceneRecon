@@ -12,12 +12,10 @@ import trimesh
 
 import utils
 
-from tsdf_fusion import TSDFVolumeTorch
-
 TARGET_RGB_IMG_SIZE = (480, 640)
 
 
-def get_scans(dataset_dir, tsdf_dir, pred_depth_dir):
+def get_scans(dataset_dir, tsdf_dir, pred_depth_dir,pred_normal_dir):
     with open(os.path.join(dataset_dir, "train.txt"), "r") as f:
         train_scan_names = sorted(set(f.read().strip().split()))
     with open(os.path.join(dataset_dir, "val.txt"), "r") as f:
@@ -46,21 +44,17 @@ def get_scans(dataset_dir, tsdf_dir, pred_depth_dir):
                 "pose_npyfile": pose_npyfile,
                 "image_dir": image_dir,
                 "pred_depth_dir": os.path.join(pred_depth_dir, scan_name),
+                "pred_normals_dir": os.path.join(pred_normal_dir,scan_name)
             }
 
             if scan_name in train_scan_names:
                 train_scans.append(scan)
-            elif scan_name in val_scan_names:
+            if scan_name in val_scan_names:
                 val_scans.append(scan)
-            elif scan_name in test_scan_names:
+            if scan_name in test_scan_names:
                 test_scans.append(scan)
             else:
                 pass
-                #print("skipping",scan_name)
-                #raise Exception()
-    # print("Train scans:",len(train_scans))
-    # print("Val scans:",len(val_scans))
-    # print("Test scans:",len(test_scans))
     return train_scans, val_scans, test_scans
 
 
@@ -120,84 +114,6 @@ def load_scan(scan, keyframes_file=None):
         K_gt_depth,
         kf_idx,
     )
-
-
-def sample_tsdf(tsdf, occ, origin, voxel_size, coords):
-    """
-    the tsdf coordinates refer to grid points:
-        (0, 0, 0): grid point (0, 0, 0)
-        etc
-
-    however grid_sample(align_corners=False) assumes they are voxels where
-        (0, 0, 0): top left edge of top left voxel
-
-    in other words:
-        our (0, 0, 0) is their (.5, .5. 5)
-        our (w - 1, h - 1, d - 1) is their (w - .5, h - .5, d - .5)
-    """
-
-    lil_optimization = True
-    if lil_optimization:
-        a = voxel_size * torch.tensor(tsdf.shape) / 2
-        b = -origin + voxel_size * 0.5 - a
-        grid = (coords + b) / a
-    else:
-        voxel_coords = (coords - origin) / voxel_size
-        grid = (voxel_coords + 0.5) / torch.tensor(tsdf.shape) * 2 - 1
-
-    grid = grid[..., [2, 1, 0]]
-    crop_tsdf_n = torch.nn.functional.grid_sample(
-        tsdf[None, None],
-        grid[None],
-        align_corners=False,
-        mode="nearest",
-        padding_mode="border",
-    )[0, 0]
-    crop_tsdf_b = torch.nn.functional.grid_sample(
-        tsdf[None, None],
-        grid[None],
-        align_corners=False,
-        mode="bilinear",
-        padding_mode="border",
-    )[0, 0]
-
-    crop_tsdf = crop_tsdf_b.clone()
-    idx = torch.isnan(crop_tsdf)
-    crop_tsdf[idx] = crop_tsdf_n[idx]
-
-    crop_occ = (
-        torch.nn.functional.grid_sample(
-            occ[None, None].float(),
-            grid[None],
-            align_corners=False,
-            mode="nearest",
-        )[0, 0]
-        > 0.5
-    ).float()
-    crop_occ.masked_fill_(crop_tsdf.isnan(), torch.nan)
-
-    oob_inds = (grid.abs() >= 1).any(dim=-1)
-    crop_tsdf.masked_fill_(oob_inds, torch.nan)
-
-    return crop_tsdf, crop_occ
-
-
-def perturb_pose(pose, rot_range=15, scale_range=0.25):
-    origin = torch.zeros((1, 4, 4), dtype=pose.dtype)
-    origin[0, :3, 3] = pose[0, :3, 3]
-    rot_angles = np.random.uniform(-rot_range, rot_range, size=3)
-    R = torch.eye(4, dtype=torch.float32)
-    R[:3, :3] = torch.from_numpy(
-        scipy.spatial.transform.Rotation.from_euler(
-            "xyz", rot_angles, degrees=True
-        ).as_matrix()
-    )
-    s = np.random.uniform(1 - scale_range, 1 + scale_range)
-
-    pose = s * R @ (pose - origin) + origin
-    return pose
-
-
 def select_views(bbox, poses, K, imsize):
     imheight, imwidth = imsize
 
@@ -210,7 +126,6 @@ def select_views(bbox, poses, K, imsize):
 
     dist = torch.norm(poses[:, None, :3, 3] - coords[None], dim=-1)
     return torch.where((valid & (dist < 4)).any(dim=-1))[0]
-
 
 def load_rgb_imgs(rgb_imgfiles, target_size=None):
     imgs = np.empty((len(rgb_imgfiles), *target_size, 3), dtype=np.uint8)
@@ -257,7 +172,7 @@ def load_depth_imgs(depth_imgfiles, imsize):
         result[i] = load_depth_img(depth_imgfiles[i])
     return torch.from_numpy(result)
 
-def load_normal_imgs(normal_imgfiles,imgsize):
+def load_normal_imgs(normal_imgfiles,imsize):
     result = np.zeros((len(normal_imgfiles), *imsize), dtype=np.float32)
     for i in range(len(normal_imgfiles)):
         result[i] = load_normal_img(normal_imgfiles[i])
@@ -274,32 +189,6 @@ def dilate_gt_occ(gt_occ):
     nanmask[gt_occ > 0.5] = False
     gt_occ.masked_fill_(nanmask, torch.nan)
     return gt_occ
-
-
-def reflect_pose(pose, plane_pt=None, plane_normal=None):
-    pts = pose @ torch.tensor(
-        [
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
-            [0, 0, 1, 0],
-            [1, 1, 1, 1],
-        ],
-        dtype=pose.dtype,
-    )
-    plane_pt = torch.tensor([*plane_pt, 1], dtype=pose.dtype)
-
-    pts = pts - plane_pt[None, :, None]
-
-    plane_normal = plane_normal / torch.norm(plane_normal)
-    m = torch.zeros((4, 4))
-    m[:3, :3] = torch.eye(3) - 2 * plane_normal[None].T @ plane_normal[None]
-
-    pts = m @ pts + plane_pt[None, :, None]
-
-    result = torch.eye(4, dtype=torch.float32)[None].repeat(len(pose), 1, 1)
-    result[:, :, :3] = pts[:, :, :3] - pts[:, :, 3:]
-    result[:, :, 3] = pts[:, :, 3]
-    return result
 
 
 class InferenceDataset(torch.utils.data.Dataset):
@@ -342,13 +231,13 @@ class InferenceDataset(torch.utils.data.Dataset):
 
                 if load_normals:
                     pred_normal_imgfile = os.path.join(
-                        scan["pred_depth_dir"],
+                        scan["pred_normals_dir"],
                         "normal",
                         os.path.basename(rgb_imgfiles[i])[:-4] + ".png",
                     )
                     K_pred_normal = torch.from_numpy(
                         np.loadtxt(
-                            os.path.join(scan["pred_depth_dir"], "intrinsic_depth.txt")
+                            os.path.join(scan["pred_normals_dir"], "intrinsic_depth.txt")
                         )[:3, :3]
                     ).float()
                 else:
@@ -496,7 +385,6 @@ class Dataset(torch.utils.data.Dataset):
         crop_voxel_size,
         crop_size_nvox,
         n_views,
-        improved_tsdf_sampling=True,
         random_translation=False,
         random_rotation=False,
         random_view_selection=False,
@@ -510,7 +398,6 @@ class Dataset(torch.utils.data.Dataset):
         self.n_views = n_views
         self.crop_voxel_size = crop_voxel_size
         self.crop_size_nvox = torch.tensor(crop_size_nvox)
-        self.improved_tsdf_sampling = improved_tsdf_sampling
         self.random_translation = random_translation
         self.random_rotation = random_rotation
         self.random_view_selection = random_view_selection
@@ -587,7 +474,7 @@ class Dataset(torch.utils.data.Dataset):
             extra_view_inds = np.random.choice(
                 unused_view_inds, size=n_sample, replace=False
             )
-            view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).int()
+            view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).long()
 
             if len(view_inds) < self.n_views:
                 # still not enough. add duplicates
@@ -595,7 +482,7 @@ class Dataset(torch.utils.data.Dataset):
                 extra_view_inds = np.random.choice(
                     list(all_view_inds), size=n_needed, replace=True
                 )
-                view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).int()
+                view_inds = torch.cat((view_inds, torch.from_numpy(extra_view_inds))).long()
 
         if self.random_view_selection:
             view_inds = np.random.choice(view_inds, size=self.n_views, replace=False)
@@ -648,7 +535,7 @@ class Dataset(torch.utils.data.Dataset):
             for rgb_imgfile in rgb_imgfiles[view_inds]:
                 pred_normals_imgfiles.append(
                     os.path.join(
-                        scan["pred_depth_dir"],
+                        scan["pred_normals_dir"],
                         "normal",
                         os.path.basename(rgb_imgfile)[:-4] + ".png",
                     )
@@ -658,87 +545,65 @@ class Dataset(torch.utils.data.Dataset):
             pred_normal_imgs = load_normal_imgs(pred_normals_imgfiles, pred_normal_img_shape)
 
             K_pred_normal = torch.from_numpy(
-                np.loadtxt(os.path.join(scan["pred_depth_dir"], "intrinsic_depth.txt"))[
+                np.loadtxt(os.path.join(scan["pred_normals_dir"], "intrinsic_depth.txt"))[
                     :3, :3
                 ]
             ).float()
 
             result["K_pred_normal"] = K_pred_normal
             result["pred_normal_imgs"] = pred_normal_imgs
-
+        #view_inds = view_inds.long()
         result["poses"] = poses[view_inds]
         result["gt_tsdf_npzfile"] = tsdf_npzfile
 
-        if self.improved_tsdf_sampling:
-            input_coords = crop_bounds.grid_coords(grid_res=self.crop_voxel_size)
+        input_coords = crop_bounds.grid_coords(grid_res=self.crop_voxel_size)
 
-            gt_occ = (gt_tsdf.abs() < 0.999).float()
-            gt_occ[gt_tsdf.isnan()] = torch.nan
-            gt_occ = dilate_gt_occ(gt_occ)
+        gt_occ = (gt_tsdf.abs() < 0.999).float()
+        gt_occ[gt_tsdf.isnan()] = torch.nan
+        gt_occ = dilate_gt_occ(gt_occ)
 
-            # start with the coords of the bounding box of the (maybe rotated) crop
-            minbound, maxbound = crop_bounds.bounding_box()
-            min_idx = ((minbound - gt_origin) / gt_voxel_size).floor()
-            max_idx = ((maxbound - gt_origin) / gt_voxel_size).ceil()
-            min_idx = torch.clamp(min_idx, torch.zeros(3), torch.tensor(gt_tsdf.shape))
-            max_idx = torch.clamp(max_idx, torch.zeros(3), torch.tensor(gt_tsdf.shape))
+        # start with the coords of the bounding box of the (maybe rotated) crop
+        minbound, maxbound = crop_bounds.bounding_box()
+        min_idx = ((minbound - gt_origin) / gt_voxel_size).floor()
+        max_idx = ((maxbound - gt_origin) / gt_voxel_size).ceil()
+        min_idx = torch.clamp(min_idx, torch.zeros(3), torch.tensor(gt_tsdf.shape))
+        max_idx = torch.clamp(max_idx, torch.zeros(3), torch.tensor(gt_tsdf.shape))
 
-            x_idx = torch.arange(min_idx[0], max_idx[0], dtype=torch.long)
-            y_idx = torch.arange(min_idx[1], max_idx[1], dtype=torch.long)
-            z_idx = torch.arange(min_idx[2], max_idx[2], dtype=torch.long)
-            xx, yy, zz = torch.meshgrid(x_idx, y_idx, z_idx, indexing="ij")
+        x_idx = torch.arange(min_idx[0], max_idx[0], dtype=torch.long)
+        y_idx = torch.arange(min_idx[1], max_idx[1], dtype=torch.long)
+        z_idx = torch.arange(min_idx[2], max_idx[2], dtype=torch.long)
+        xx, yy, zz = torch.meshgrid(x_idx, y_idx, z_idx, indexing="ij")
 
-            idxs = torch.stack((xx, yy, zz), dim=-1).view(-1, 3)
+        idxs = torch.stack((xx, yy, zz), dim=-1).view(-1, 3)
 
-            bad_idxs = torch.any(
-                (idxs < 0) | (idxs >= torch.tensor(gt_tsdf.shape)), dim=-1
+        bad_idxs = torch.any(
+            (idxs < 0) | (idxs >= torch.tensor(gt_tsdf.shape)), dim=-1
+        )
+        idxs = idxs[~bad_idxs]
+
+        gt_tsdf = gt_tsdf[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
+        gt_occ = gt_occ[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
+        output_coords = idxs * gt_voxel_size + gt_origin
+
+        # narrow down to just the coords inside the crop
+        idx = crop_bounds.contains(output_coords)
+        output_coords = output_coords[idx]
+        gt_tsdf = gt_tsdf[idx]
+        gt_occ = gt_occ[idx]
+
+        nsample = torch.div(torch.prod(self.crop_size_nvox), 4,rounding_mode="trunc")
+        if len(gt_tsdf) < nsample:
+            print(
+                f"resampling ({len(gt_tsdf)} / {nsample})",
+                scan["scan_name"],
             )
-            idxs = idxs[~bad_idxs]
+            return self[np.random.choice(len(self))]
 
-            gt_tsdf = gt_tsdf[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
-            gt_occ = gt_occ[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
-            output_coords = idxs * gt_voxel_size + gt_origin
+        idx = np.random.choice(len(gt_tsdf), size=int(nsample), replace=False)
 
-            # narrow down to just the coords inside the crop
-            idx = crop_bounds.contains(output_coords)
-            output_coords = output_coords[idx]
-            gt_tsdf = gt_tsdf[idx]
-            gt_occ = gt_occ[idx]
-
-            nsample = torch.prod(self.crop_size_nvox) // 4
-            if len(gt_tsdf) < nsample:
-                print(
-                    f"resampling ({len(gt_tsdf)} / {nsample})",
-                    scan["scan_name"],
-                )
-                return self[np.random.choice(len(self))]
-
-            idx = np.random.choice(len(gt_tsdf), size=int(nsample), replace=False)
-
-            output_coords = output_coords[idx]
-            gt_tsdf = gt_tsdf[idx]
-            gt_occ = gt_occ[idx]
-        else:
-            gt_occ = (gt_tsdf.abs() < 0.999).float()
-            gt_occ[gt_tsdf.isnan()] = torch.nan
-            gt_occ = dilate_gt_occ(gt_occ)
-
-            output_coords = input_coords = crop_bounds.grid_coords(
-                grid_res=self.crop_voxel_size
-            )
-            gt_tsdf, gt_occ = sample_tsdf(
-                gt_tsdf, gt_occ, gt_origin, gt_voxel_size, input_coords
-            )
-
-            gt_tsdf = gt_tsdf.view(-1)
-            gt_occ = gt_occ.view(-1)
-            output_coords = output_coords.view(-1, 3)
-
-            if ~(gt_occ.any()):
-                if self.random_rotation or self.random_translation:
-                    return self[scan_idx]
-                else:
-                    raise Exception("infinite recursion. needs a different origin")
+        output_coords = output_coords[idx]
+        gt_tsdf = gt_tsdf[idx]
+        gt_occ = gt_occ[idx]
 
         result["output_coords"] = output_coords
         result["gt_tsdf"] = gt_tsdf

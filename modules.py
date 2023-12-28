@@ -56,6 +56,61 @@ class Cnn3d(torch.nn.Module):
         return out
 
 
+class FeatureVolumeCNN2D(torch.nn.Module):
+    def __init__(self, in_c):
+        super().__init__()
+
+        channels = [64,64, 128, 64,in_c]
+        self.out_c = in_c
+        
+        self.stem = torch.nn.Sequential(
+            ConvBnRelu2d(in_c, channels[0], ks=1, padding=0),
+            ResBlock2d(channels[0]),
+        )
+        self.conv1x1_1 = ConvBnRelu2d(channels[0], channels[1])
+        self.down1 = torch.nn.Sequential(
+            ResBlock2d(channels[1]),
+            ResBlock2d(channels[1]),
+        )
+        self.conv1x1_2 = ConvBnRelu2d(channels[1], channels[2])
+        self.down2 = torch.nn.Sequential(
+            ResBlock2d(channels[2]),
+            ResBlock2d(channels[2]),
+        )
+        self.up1 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[2] + channels[1], channels[3]),
+            ResBlock2d(channels[3]),
+            ResBlock2d(channels[3]),
+        )
+        self.up2 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[3] + channels[0], channels[4]),
+            ResBlock2d(channels[4]),
+            ResBlock2d(channels[4]),
+        )
+        self.up3 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[4] + in_c, channels[4]),
+            ResBlock2d(channels[4]),
+            ResBlock2d(channels[4]),
+        )
+
+
+    def forward(self, x):
+        x0 = self.stem(x)
+        x1 = torch.nn.functional.max_pool2d(self.conv1x1_1(x0), 2)
+        x1 = self.down1(x1)
+        out = torch.nn.functional.max_pool2d(self.conv1x1_2(x1), 2)
+        out = self.down2(out)
+        out = torch.nn.functional.interpolate(out, scale_factor=2, mode="nearest")
+        out = torch.cat((out, x1), dim=1)
+        out = self.up1(out)
+        out = torch.nn.functional.interpolate(out, scale_factor=2, mode="nearest")
+        out = torch.cat((out, x0), dim=1)
+        out = self.up2(out)
+        out = torch.cat((out, x), dim=1)
+        out = self.up3(out)
+        return out
+
+
 class Cnn2d(torch.nn.Module):
     def __init__(self, out_dim=64):
         super().__init__()
@@ -191,3 +246,84 @@ class ConvBnRelu3d(torch.nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+class ConvBnRelu2d(torch.nn.Module):
+    def __init__(self, in_c, out_c, ks=3, padding=1):
+        super().__init__()
+
+        self.net = torch.nn.Sequential(
+            torch.nn.Conv2d(in_c, out_c, ks, padding=padding, bias=False),
+            torch.nn.BatchNorm2d(out_c),
+            torch.nn.LeakyReLU(True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class FeatureVolumeMLP(torch.nn.Module):
+    def __init__(self,in_c,channels=[128,128,1]):
+        super().__init__()
+        layers = []
+        layers.append(torch.nn.Linear(in_c,channels[0]))
+        for i in range(len(channels)-1):
+            layers.append(torch.nn.Linear(channels[i], 
+                                channels[i+1]))
+            layers.append(torch.nn.LeakyReLU(inplace=True))
+        self.net = torch.nn.Sequential(*layers)
+    def forward(self, x):
+        return self.net(x)
+    
+class PlanarFeatureCNN2D(torch.nn.Module):
+    def __init__(self, in_c,out_c):
+        super().__init__()
+
+        channels = [64,64, 128, 64,out_c]
+        self.out_c = out_c
+        
+        self.stem = torch.nn.Sequential(
+            ConvBnRelu2d(in_c, channels[0], ks=1, padding=0),
+            ResBlock2d(channels[0]),
+        )
+        self.conv1x1_1 = ConvBnRelu2d(channels[0], channels[1])
+        self.down1 = torch.nn.Sequential(
+            ResBlock2d(channels[1]),
+            ResBlock2d(channels[1]),
+        )
+        self.conv1x1_2 = ConvBnRelu2d(channels[1], channels[2])
+        self.down2 = torch.nn.Sequential(
+            ResBlock2d(channels[2]),
+            ResBlock2d(channels[2]),
+        )
+        self.up1 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[2] + channels[1], channels[3]),
+            ResBlock2d(channels[3]),
+            ResBlock2d(channels[3]),
+        )
+        self.up2 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[3] + channels[0], channels[4]),
+            ResBlock2d(channels[4]),
+            ResBlock2d(channels[4]),
+        )
+        self.up3 = torch.nn.Sequential(
+            ConvBnRelu2d(channels[4] + in_c, channels[4]),
+            ResBlock2d(channels[4]),
+            ResBlock2d(channels[4]),
+        )
+
+
+    def forward(self, x):
+        x0 = self.stem(x)
+        x1 = torch.nn.functional.max_pool2d(self.conv1x1_1(x0), 2)
+        x1 = self.down1(x1)
+        out = torch.nn.functional.max_pool2d(self.conv1x1_2(x1), 2)
+        out = self.down2(out)
+        out = torch.nn.functional.interpolate(out, scale_factor=2, mode="nearest")
+        out = torch.cat((out, x1), dim=1)
+        out = self.up1(out)
+        out = torch.nn.functional.interpolate(out, scale_factor=2, mode="nearest")
+        out = torch.cat((out, x0), dim=1)
+        out = self.up2(out)
+        out = torch.cat((out, x), dim=1)
+        out = self.up3(out)
+        return out

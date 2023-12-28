@@ -1,0 +1,57 @@
+offline_logging: True
+
+improved_tsdf_sampling: True
+
+depth_guidance:
+  pred_depth_dir: "/scratch/students/2023-fall-acheche/data/scannet_simplerecon/outputs/converted_depth_est"
+  depth_scale_augmentation: True
+  tsdf_fusion_channel: True
+
+
+dataset_dir: "/scratch/students/2023-fall-acheche/data/scannet/scannet-finerecon/scans"
+tsdf_dir: "/scratch/students/2023-fall-acheche/data/scannet/tsdf_gt"
+normals_dir : "/scratch/students/2023-fall-acheche/data/scannet_simplerecon/outputs/converted_depth_est"
+test_keyframes_file: "/scratch/students/2023-fall-acheche/ml-finerecon/keyframes.json"
+
+# Parameters
+img_feature_dim: 17
+voxel_size: 0.02
+output_sample_rate: 2
+
+feature_volume:
+  enabled: True
+  n_voxels: [172, 172, 172]
+  append_var: True
+  use_2dcnn: False
+point_backprojection:
+  enabled: True
+  append_var: True
+
+planar_feature_encoder:
+  enabled: True
+  append_var: False
+  channels: 64 # number of channels for output of the 2D CNN for feature encoder
+  plane_resolution: 512
+  
+
+
+
+n_views_train: 20
+n_views_val: 20
+
+
+initial_lr: 0.001
+steps: 60_000
+finetune_steps: 10_000
+workers_train: 8
+workers_val: 8
+workers_predict: 8
+batch_size_per_device: 1
+val_batch_size_per_device: 1
+
+
+
+# if no keyframes file is provided then inference will use every frame
+
+
+do_prediction_timing: False

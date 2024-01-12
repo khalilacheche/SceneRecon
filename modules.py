@@ -180,11 +180,11 @@ class FeatureFusion(torch.nn.Module):
     def forward(self, x, valid):
         counts = torch.sum(valid, dim=1, keepdim=True)
         x.masked_fill_(~valid[:, :, None], 0)
-        mean = x / counts[:, :, None]
+        mean = x / (counts[:, :, None] + 1e-8 )
         mean = mean.sum(dim=1)
         mean.masked_fill_(counts == 0, 0)
         if self.include_variance:
-            var = ((x-mean[:,None])**2).sum(dim=1)/counts
+            var = ((x-mean[:,None])**2).sum(dim=1)/(counts + 1e-8 )
             var.masked_fill_(counts <= 1, 0)
             return self.bn(torch.cat([mean,var],dim=1))
         return self.bn(mean)

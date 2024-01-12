@@ -13,7 +13,11 @@ import utils
 
 import einops
 from torch_scatter import scatter_mean
+from torch_scatter.composite import scatter_std
 
+from pytorch3d.ops.marching_cubes import marching_cubes
+import pytorch3d
+import skimage
 
 class FineRecon(pl.LightningModule):
     def __init__(self, config):
@@ -41,6 +45,11 @@ class FineRecon(pl.LightningModule):
         
         if config.planar_feature_encoder.enabled:
             self.planar_feature_in_channels = img_feature_dim + 4 # CNN2D out + 3 normal channels + 1 depth
+            if config.improved_depth.enabled:
+                self.planar_feature_in_channels = img_feature_dim * (2 if config.planar_feature_encoder.append_var else 1)
+                
+            if config.planar_feature_encoder.append_var:
+                self.planar_feature_in_channels *=2
             self.triplane_cnns = []
             self.cnn_xy = modules.PlanarFeatureCNN2D(self.planar_feature_in_channels,config.planar_feature_encoder.channels)
             self.cnn_xz = modules.PlanarFeatureCNN2D(self.planar_feature_in_channels,config.planar_feature_encoder.channels)
@@ -75,8 +84,10 @@ class FineRecon(pl.LightningModule):
             if self.dg.tsdf_fusion_channel:
                 surface_pred_input_dim += 1
         if config.planar_feature_encoder.enabled:
-            surface_pred_input_dim += config.planar_feature_encoder.channels * 3
-            occ_pred_input_dim += config.planar_feature_encoder.channels * 3
+            agg = config.planar_feature_encoder.aggregation
+            multiplier = 3 if (agg == "concat") else 2 if agg == "mean_var" else 1
+            surface_pred_input_dim += 3 if agg=="dot_prod" else config.planar_feature_encoder.channels * multiplier
+            occ_pred_input_dim += 3 if agg=="dot_prod" else config.planar_feature_encoder.channels * multiplier
 
         
         self.surface_predictor = torch.nn.Sequential(
@@ -214,20 +225,20 @@ class FineRecon(pl.LightningModule):
         rgb_imsize = (imheight, imwidth)
         img_feats = self.cnn2d(rgb_imgs.view(batch_size * n_imgs, 3, imheight, imwidth))
         img_feats = img_feats.view(batch_size, n_imgs, *img_feats.shape[1:])
-
-        voxel_feats, voxel_valid = utils.sample_voxel_feats_(
-            poses=batch["poses"],
-            xyz=batch["input_coords"],
-            rgb_imsize=rgb_imsize,
-            img_feats=img_feats,
-            K_rgb=batch["K_color"][:, None],
-            depth_imgs=batch["pred_depth_imgs"],
-            K_depth=batch["K_pred_depth"][:, None],
-            normal_imgs=batch["pred_normal_imgs"],
-            K_normal=batch["K_pred_normal"][:, None],
-        )
-        voxel_feats = self.fusion(voxel_feats, voxel_valid)
-        voxel_valid = voxel_valid.sum(dim=1) > 1
+        if self.config.feature_volume.enabled:
+            voxel_feats, voxel_valid = utils.sample_voxel_feats_(
+                poses=batch["poses"],
+                xyz=batch["input_coords"],
+                rgb_imsize=rgb_imsize,
+                img_feats=img_feats,
+                K_rgb=batch["K_color"][:, None],
+                depth_imgs=batch["pred_depth_imgs"],
+                K_depth=batch["K_pred_depth"][:, None],
+                normal_imgs=batch["pred_normal_imgs"],
+                K_normal=batch["K_pred_normal"][:, None],
+            )
+            voxel_feats = self.fusion(voxel_feats, voxel_valid)
+            voxel_valid = voxel_valid.sum(dim=1) > 1
 
         if self.dg.tsdf_fusion_channel:
             tsdf, weight = self.tsdf_fusion(
@@ -237,64 +248,113 @@ class FineRecon(pl.LightningModule):
                 batch["input_coords"],
             )
             tsdf.masked_fill_(weight == 0, 1)
-            voxel_feats = torch.cat((voxel_feats, tsdf[:, None]), dim=1)
-        
-        if self.config.feature_volume.use_2dcnn:
-            batch_size, channels, width, depth, height = voxel_feats.shape
-            voxel_f = voxel_feats.view(-1, channels)
-            voxel_f = self.fv_mlp(voxel_f)
-            voxel_f = voxel_f.view(batch_size,width, depth, height,-1).squeeze(-1)
-            voxel_f = einops.rearrange(voxel_f, "B W D H -> B H W D") # we want the height as channel for CNN, CNN expects B C W H, so move height dimension to channel
-            voxel_f = self.fv_cnn2d(voxel_f)
-            voxel_f = einops.rearrange(voxel_f, "B H W D -> B W D H") # Get it back
-            voxel_feats = voxel_f.unsqueeze(1) # Make it a one-dimensional channel
-        else :
-            voxel_feats = self.cnn3d(voxel_feats, voxel_valid)
+            if self.config.feature_volume.enabled:
+                voxel_feats = torch.cat((voxel_feats, tsdf[:, None]), dim=1)
+        if self.config.feature_volume.enabled:
+            if self.config.feature_volume.use_2dcnn:
+                batch_size, channels, width, depth, height = voxel_feats.shape
+                voxel_f = voxel_feats.view(-1, channels)
+                voxel_f = self.fv_mlp(voxel_f)
+                voxel_f = voxel_f.view(batch_size,width, depth, height,-1).squeeze(-1)
+                voxel_f = einops.rearrange(voxel_f, "B W D H -> B H W D") # we want the height as channel for CNN, CNN expects B C W H, so move height dimension to channel
+                voxel_f = self.fv_cnn2d(voxel_f)
+                voxel_f = einops.rearrange(voxel_f, "B H W D -> B W D H") # Get it back
+                voxel_feats = voxel_f.unsqueeze(1) # Make it a one-dimensional channel
+            else :
+                voxel_feats = self.cnn3d(voxel_feats, voxel_valid)
 
 
         if self.config.planar_feature_encoder.enabled:
-            params ={}
-            params["poses"] = batch["poses"]
-            params["depth_imgs"] = batch["pred_depth_imgs"]
-            params["img_feats"] = img_feats
-            params["K_rgb"] = batch["K_color"][:, None]
-            params["K_depth"] = batch["K_pred_depth"][:, None]
-            params["normal_imgs"] = batch["pred_normal_imgs"]
-            params["K_normal"] = batch["K_pred_normal"][:, None]
-            params["crop_center"] = batch["crop_center"]
-            params["crop_rotation"] = batch["crop_rotation"]
-            params["crop_size_m"] = batch["crop_size_m"]
-            planar_features = utils.build_triplane_feature_encoder(params,self.triplane_cnns,self.device,self.config.planar_feature_encoder.plane_resolution)
+            if self.config.improved_depth.enabled:
+                params={}
+                # build mesh from tsdf
+                verts = []
+                faces = []
+                ## potential bottlneck
+                for i in range(batch_size):
+                    tsdf_b = tsdf[i]; weight_b = weight[i] ; origin = batch["crop_center"][i]
+                    mask = weight_b > 0
+                    mask = mask.cpu().numpy()
+                    verts_, faces_, _, _ = skimage.measure.marching_cubes(tsdf_b.clone().cpu().numpy(), level=0.5 ,mask=mask)
+                    faces_ = faces_[~np.any(np.isnan(verts_[faces_]), axis=(1, 2))]
+                    verts_ = verts_ * self.config.voxel_size + origin.cpu().numpy()
+                    verts_ = torch.tensor(verts_.copy(),device=self.device,dtype=torch.float)
+                    verts.append(verts_)
+                    faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
+                    faces.append(faces_)
+                meshes = pytorch3d.structures.Meshes(verts, faces)
+                if self.config.improved_depth.debug_save_meshes:
+                    from pytorch3d.io import IO
+                    ptio = IO()
+                    for i,scan_name in enumerate(batch["scan_name"]):
+                        ptio.save_mesh(meshes[i],f"debug/{scan_name}-trimesh-data-pt3d-export.ply")
+                # sample mesh
+                xyz_mesh_samples = pytorch3d.ops.sample_points_from_meshes(meshes,num_samples=self.config.improved_depth.n_samples)
+                # build planar_features
+                plane_reso = self.config.planar_feature_encoder.plane_resolution
+                append_v = self.config.planar_feature_encoder.append_var
+                # save xyz_mesh_samples and batch["output_coords"]
+                #utils.points_to_csv(xyz_mesh_samples,f"debug/{batch['scan_name'][0]}_xyz_mesh_samples.csv")
+                #utils.points_to_csv(batch["output_coords"],f"debug/{batch['scan_name'][0]}_output_coords.csv")
 
+                params ={}
+                params["poses"] = batch["poses"]
+                params["img_feats"] = img_feats
+                params["K_rgb"] = batch["K_color"][:, None]
+                params["xyz"] = xyz_mesh_samples
+                params["crop_center"] = batch["crop_center"]
+                params["crop_rotation"] = batch["crop_rotation"]
+                params["crop_size_m"] = batch["crop_size_m"]
+                params["rgb_imsize"] = rgb_imsize
+                params["poses"] = batch["poses"]
+                #import ipdb;ipdb.set_trace()
+                planar_features = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build-pc.csv")
 
+            else:
+                params ={}
+                params["poses"] = batch["poses"]
+                params["depth_imgs"] = batch["pred_depth_imgs"]
+                params["img_feats"] = img_feats
+                params["K_rgb"] = batch["K_color"][:, None]
+                params["K_depth"] = batch["K_pred_depth"][:, None]
+                params["normal_imgs"] = batch["pred_normal_imgs"]
+                params["K_normal"] = batch["K_pred_normal"][:, None]
+                params["crop_center"] = batch["crop_center"]
+                params["crop_rotation"] = batch["crop_rotation"]
+                params["crop_size_m"] = batch["crop_size_m"]
+                plane_reso = self.config.planar_feature_encoder.plane_resolution
+                append_v = self.config.planar_feature_encoder.append_var
+                planar_features = utils.build_triplane_feature_encoder(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build.csv")
+
+        
 
         """
         interpolate the features to the points where we have GT tsdf
         """
-
+        surface_prediction_feats = []
+        occupancy_prediction_feats = []
+        
         t = batch["crop_center"]
         R = batch["crop_rotation"]
         coords = batch["output_coords"]
+        occupancy_mask = torch.ones_like(batch["gt_occ"]).bool()
+        surface_prediction_mask = torch.ones_like(batch["gt_occ"]).bool()
 
         with torch.autocast(enabled=False, device_type=self.device.type):
             coords_local = (coords - t[:, None]) @ R
         coords_local += batch["crop_size_m"][:, None] / 2
         origin = torch.zeros_like(batch["gt_origin"])
-
-        (
-            coarse_point_feats,
-            coarse_point_valid,
-        ) = self.sample_point_features_by_linear_interp(
-            coords_local, voxel_feats, voxel_valid, origin
-        )
-        surface_prediction_feats = []
-        occupancy_prediction_feats = []
         if self.config.feature_volume.enabled:
+            (
+                coarse_point_feats,
+                coarse_point_valid,
+            ) = self.sample_point_features_by_linear_interp(
+                coords_local, voxel_feats, voxel_valid, origin
+            )
             occupancy_prediction_feats.append(coarse_point_feats)
             surface_prediction_feats.append(coarse_point_feats)
-            
-        occupancy_mask = coarse_point_valid
-        surface_prediction_mask = coarse_point_valid
+            occupancy_mask = coarse_point_valid 
+            surface_prediction_mask = coarse_point_valid
 
         if self.perform_point_backprojection:
             fine_img_feats = self.cnn2d_pb(
@@ -320,7 +380,7 @@ class FineRecon(pl.LightningModule):
             fine_point_feats = self.point_fusion(
                 fine_point_feats[..., None, None], fine_point_valid[..., None, None]
             )[..., 0, 0]
-            fine_point_valid = coarse_point_valid & (fine_point_valid.any(dim=1))
+            fine_point_valid = (fine_point_valid.any(dim=1))
             fine_point_feats = self.point_feat_mlp(fine_point_feats)
             surface_prediction_feats.append(fine_point_feats)
             surface_prediction_mask = fine_point_valid
@@ -335,10 +395,10 @@ class FineRecon(pl.LightningModule):
                 tsdf.masked_fill_(weight == 0, 1)
                 surface_prediction_feats.append(tsdf[:, None])
         if self.config.planar_feature_encoder.enabled:
-            fine_planar_features = utils.sample_planar_features(planar_features,batch["output_coords"],params)
+            #import ipdb; ipdb.set_trace()
+            fine_planar_features = utils.sample_planar_features(planar_features,batch["output_coords"],params=params,aggregation=self.config.planar_feature_encoder.aggregation)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-sample-pc.csv")
             surface_prediction_feats.append(fine_planar_features)
-            coarse_planar_features = utils.sample_planar_features(planar_features, batch["output_coords"],params)
-            occupancy_prediction_feats.append(coarse_planar_features)
+            occupancy_prediction_feats.append(fine_planar_features)
 
             
 
@@ -406,8 +466,9 @@ class FineRecon(pl.LightningModule):
 
     def predict_cleanup(self):
         del self.global_coords
-        del self.M
-        del self.running_count
+        if self.config.feature_volume.enabled:
+            del self.M
+            del self.running_count
 
         del self.keyframe_rgb
         del self.keyframe_pose
@@ -439,7 +500,7 @@ class FineRecon(pl.LightningModule):
         y = torch.arange(
             minbound[1], maxbound[1], self.config.voxel_size, dtype=torch.float32
         )
-        if self.config.feature_volume.use_2dcnn: # when using 2D CNN for feature volume, we need to take the same voxel size as train, since the filters of the 2DCNN are weighted
+        if self.config.feature_volume.enabled and self.config.feature_volume.use_2dcnn: # when using 2D CNN for feature volume, we need to take the same voxel size as train, since the filters of the 2DCNN are weighted
             z = torch.arange(
                 minbound[1],(minbound[2]+ (self.config.voxel_size*self.config.feature_volume.n_voxels[2])),self.config.voxel_size,dtype=torch.float32
             )
@@ -451,12 +512,13 @@ class FineRecon(pl.LightningModule):
         xx, yy, zz = torch.meshgrid(x, y, z, indexing="ij")
         self.global_coords = torch.stack((xx, yy, zz), dim=-1).to(self.device)
         nvox = xx.shape
-        self.running_count = torch.zeros(nvox, dtype=torch.float32, device=self.device)
-        self.M = torch.zeros(
-            (self.fusion.out_c, *nvox),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        if self.config.feature_volume.enabled:
+            self.running_count = torch.zeros(nvox, dtype=torch.float32, device=self.device)
+            self.M = torch.zeros(
+                (self.fusion.out_c, *nvox),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
         self.keyframe_rgb = []
         self.keyframe_pose = []
@@ -481,11 +543,12 @@ class FineRecon(pl.LightningModule):
             self.n_inits += 1
 
     def predict_per_view(self, batch):
-        # fuse each view into the scene volume
+        # for each iamge, update the feature volume or add the projected points with features to the list
 
         if self.config.do_prediction_timing:
             torch.cuda.synchronize()
             t0 = time.time()
+
 
         batch_size, n_imgs, _, imheight, imwidth = batch["rgb_imgs"].shape
         imsize = imheight, imwidth
@@ -503,22 +566,6 @@ class FineRecon(pl.LightningModule):
         )
         valid = valid[0, 0]
         coords = self.global_coords[valid][None, None, None]
-
-        (
-            img_voxel_feats,
-            img_voxel_valid,
-        ) = utils.sample_voxel_feats_(
-            poses=batch["poses"][None],
-            xyz=coords,
-            rgb_imsize=imsize,
-            img_feats=img_feats,
-            K_rgb=batch["K_color"][None],
-            depth_imgs=batch["pred_depth_imgs"],
-            K_depth=batch["K_pred_depth"][None],
-            normal_imgs=batch["pred_normal_imgs"],
-            K_normal=batch["K_pred_normal"][None],
-        )
-
         if self.dg.tsdf_fusion_channel:
             tsdf, tsdf_weight = self.tsdf_fusion(
                 batch["pred_depth_imgs"],
@@ -530,46 +577,6 @@ class FineRecon(pl.LightningModule):
             tsdf_weight = tsdf_weight[0, 0, 0]
             tsdf.masked_fill_(tsdf_weight == 0, 0)
 
-        img_voxel_feats.masked_fill_(~img_voxel_valid[:, :, None], 0)
-
-        old_count = self.running_count[valid].clone()
-        self.running_count[valid] += img_voxel_valid[0, 0, 0, 0]
-        new_count = self.running_count[valid]
-        x = img_voxel_feats[0, 0, :, 0, 0]
-
-        if self.config.feature_volume.append_var:
-            c = (
-                self.total_feats
-            )  # Assuming the first half is mean, and the second is variance
-            valid_mean = self.M[:c, valid]
-            valid_var = self.M[c:, valid]
-
-            # Online mean calculation
-            new_mean = x / new_count[None] + (old_count / new_count)[None] * valid_mean
-            self.M[:c, valid] = new_mean
-
-            # Masking the invalid counts for mean
-            self.M[:c].masked_fill_(self.running_count[None] == 0, 0)
-
-            # Online variance calculation based on the updated mean
-            delta = x - new_mean
-            new_var = valid_var + delta * (x - new_mean - delta)
-            self.M[c:, valid] = new_var
-            if batch["final_frame"][0]:
-                # to get the true variance, we need to divide the var component of M by the running count in the last frame
-                # update variance part
-                self.M[c:, valid] = self.M[c:, valid] / self.running_count[valid]
-
-            # Masking the invalid counts for variance
-            self.M[c:].masked_fill_(self.running_count[None] <= 1, 0)
-
-        else:
-            old_m = self.M[:, valid]
-            new_m = x / new_count[None] + (old_count / new_count)[None] * old_m
-            self.M[:, valid] = new_m
-            self.M.masked_fill_(self.running_count[None] == 0, 0)
-
-        if self.dg.tsdf_fusion_channel:
             old_count = self.running_tsdf_weight[valid]
             self.running_tsdf_weight[valid] += tsdf_weight
             new_count = self.running_tsdf_weight[valid]
@@ -577,8 +584,66 @@ class FineRecon(pl.LightningModule):
             self.running_tsdf[valid] = (
                 tsdf / denom + (old_count / denom) * self.running_tsdf[valid]
             )
+        if self.config.feature_volume.enabled:
+            (
+                img_voxel_feats,
+                img_voxel_valid,
+            ) = utils.sample_voxel_feats_(
+                poses=batch["poses"][None],
+                xyz=coords,
+                rgb_imsize=imsize,
+                img_feats=img_feats,
+                K_rgb=batch["K_color"][None],
+                depth_imgs=batch["pred_depth_imgs"],
+                K_depth=batch["K_pred_depth"][None],
+                normal_imgs=batch["pred_normal_imgs"],
+                K_normal=batch["K_pred_normal"][None],
+            )
+            
+
+
+            img_voxel_feats.masked_fill_(~img_voxel_valid[:, :, None], 0)
+
+            old_count = self.running_count[valid].clone()
+            self.running_count[valid] += img_voxel_valid[0, 0, 0, 0]
+            new_count = self.running_count[valid]
+            x = img_voxel_feats[0, 0, :, 0, 0]
+
+            if self.config.feature_volume.append_var:
+                c = (
+                    self.total_feats
+                )  # Assuming the first half is mean, and the second is variance
+                valid_mean = self.M[:c, valid]
+                valid_var = self.M[c:, valid]
+
+                # Online mean calculation
+                new_mean = x / new_count[None] + (old_count / new_count)[None] * valid_mean
+                self.M[:c, valid] = new_mean
+
+                # Masking the invalid counts for mean
+                self.M[:c].masked_fill_(self.running_count[None] == 0, 0)
+
+                # Online variance calculation based on the updated mean
+                delta = x - new_mean
+                new_var = valid_var + delta * (x - new_mean - delta)
+                self.M[c:, valid] = new_var
+                if batch["final_frame"][0]:
+                    # to get the true variance, we need to divide the var component of M by the running count in the last frame
+                    # update variance part
+                    self.M[c:, valid] = self.M[c:, valid] / self.running_count[valid]
+
+                # Masking the invalid counts for variance
+                self.M[c:].masked_fill_(self.running_count[None] <= 1, 0)
+
+            else:
+                old_m = self.M[:, valid]
+                new_m = x / new_count[None] + (old_count / new_count)[None] * old_m
+                self.M[:, valid] = new_m
+                self.M.masked_fill_(self.running_count[None] == 0, 0)
+
+       
         
-        if self.config.planar_feature_encoder.enabled:
+        if self.config.planar_feature_encoder.enabled and not self.config.improved_depth.enabled:
             poses = batch["poses"]
             depth_imgs = batch["pred_depth_imgs"]
             img_feats = img_feats
@@ -616,18 +681,13 @@ class FineRecon(pl.LightningModule):
 
             _,_,H,W,_ = xyz_pixel.shape
 
-            # then we calculate the camera coordinate points
             
             xyz_cams = torch.inverse(K_depth) @ xyz_pixel.reshape(B,Nv,H*W,-1).permute(0,1,3,2)
-            # xyz_cams is [1, 3, 983040], add one dim, to make it 4
             xyz_cams = torch.cat([xyz_cams, torch.ones(B,Nv,1,H*W).to(self.device)], dim=2)
 
-            # xyz_cams
 
-            # then we calculate the world coordinate 
             xyz_world = poses.float() @ xyz_cams
 
-            # NOTE: is the coordinate already normaled? not really, there is shifting and rotation
 
             sparse_point_coords = xyz_world[:,:,:3,:]
             sparse_point_coords = sparse_point_coords.permute(0,1,3,2)
@@ -673,73 +733,125 @@ class FineRecon(pl.LightningModule):
         if self.config.do_prediction_timing:
             torch.cuda.synchronize()
             t0 = time.time()
+        global_valid = torch.ones(self.global_coords.shape[:-1], dtype=torch.float32, device=self.device).bool()
+        if self.config.feature_volume.enabled:
+            global_feats = self.M
 
-        global_feats = self.M
+            global_feats = self.fusion.bn(global_feats[None]).squeeze(0)
 
-        global_feats = self.fusion.bn(global_feats[None]).squeeze(0)
+            if self.dg.tsdf_fusion_channel:
+                self.running_tsdf.masked_fill_(self.running_tsdf_weight == 0, 1)
+                extra = self.running_tsdf[None]
+                global_feats = torch.cat((global_feats, extra), dim=0)
 
-        if self.dg.tsdf_fusion_channel:
-            self.running_tsdf.masked_fill_(self.running_tsdf_weight == 0, 1)
-            extra = self.running_tsdf[None]
-            global_feats = torch.cat((global_feats, extra), dim=0)
+            if self.config.feature_volume.use_2dcnn:
+                batch_size, channels, width, height, depth = global_feats[None].shape
+                voxel_f = global_feats[None].view(-1, channels)
+                voxel_f = self.fv_mlp(voxel_f)
+                voxel_f = voxel_f.view(batch_size,width, height, depth,-1).squeeze(-1)
+                voxel_f = einops.rearrange(voxel_f, "B W D H -> B H W D") # we want the height as channel for CNN, CNN expects B C W H, so move height dimension to channel
+                voxel_f = self.fv_cnn2d(voxel_f)
+                voxel_f = einops.rearrange(voxel_f, "B H W D -> B W D H") # Get it back
+                global_feats = voxel_f.unsqueeze(1)
 
-        if self.config.feature_volume.use_2dcnn:
-            batch_size, channels, width, height, depth = global_feats[None].shape
-            voxel_f = global_feats[None].view(-1, channels)
-            voxel_f = self.fv_mlp(voxel_f)
-            voxel_f = voxel_f.view(batch_size,width, height, depth,-1).squeeze(-1)
-            voxel_f = einops.rearrange(voxel_f, "B W D H -> B H W D") # we want the height as channel for CNN, CNN expects B C W H, so move height dimension to channel
-            voxel_f = self.fv_cnn2d(voxel_f)
-            voxel_f = einops.rearrange(voxel_f, "B H W D -> B W D H") # Get it back
-            global_feats = voxel_f.unsqueeze(1)
+            else:
+                global_feats = self.cnn3d(global_feats[None], self.running_count[None] > 0)
+                global_valid = global_valid & (self.running_count > 0)
 
-        else:
-            global_feats = self.cnn3d(global_feats[None], self.running_count[None] > 0)
-            
-        global_valid = self.running_count > 0
-
-        coarse_spatial_dims = np.array(global_feats.shape[2:])
+        coarse_spatial_dims = np.array(self.global_coords.shape[:-1])
         fine_spatial_dims = coarse_spatial_dims * self.config.output_sample_rate
         
 
 
         if self.config.planar_feature_encoder.enabled:
-            plane_resolution = self.config.planar_feature_encoder.plane_resolution
-            c_dim = self.planar_feature_in_channels
-            sparse_point_coords_norm = torch.cat(self.sparse_points_coords_norm,dim=1)
-            sparse_point_feats = torch.cat(self.sparse_points_feats,dim=1)
-            #utils.points_to_csv(sparse_point_coords_norm,f"debug/{batch['scan_name'][0]}-final.csv")
-            planes = ["xy","xz","yz"]
-            feature_planes = []
-            for i,plane in enumerate(planes):
-                # convert the sparse points to a unit cube
-                xy = utils.normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane,range="0:1")
-                index = utils.coordinate2index(xy, plane_resolution)
-                fea_plane = sparse_point_feats.new_zeros(1, c_dim, plane_resolution**2)
-                #c = c.permute(0, 2, 1) # B x 512 x T
-                fea_plane = scatter_mean(sparse_point_feats.permute(0,2,1), index, out=fea_plane) # B x 512 x reso^2
-                fea_plane = fea_plane.reshape(1, c_dim, plane_resolution, plane_resolution) # sparce matrix (B x 512 x reso x reso)
-                # pass through 2D CNN
-                fea_plane = self.triplane_cnns[i](fea_plane)
-                feature_planes.append(fea_plane)
+            if self.config.improved_depth.enabled:
+                tsdf_b = self.running_tsdf
+                weight_b = self.running_tsdf_weight
+                origin = batch["gt_origin"]
+                params={}
+                # build mesh from tsdf
+                verts = []
+                faces = []
+                ## potential bottlneck
+                
+                scale = (batch["gt_maxbound"] - batch["gt_origin"])
+                mask = weight_b > 0
+                mask = mask.cpu().numpy()
+                verts_, faces_, _, _ = skimage.measure.marching_cubes(tsdf_b.clone().cpu().numpy(), level=0.5 ,mask=mask)
+                faces_ = faces_[~np.any(np.isnan(verts_[faces_]), axis=(1, 2))]
+                verts_ = verts_ * self.config.voxel_size + origin.cpu().numpy()
+                verts_ = torch.tensor(verts_.copy(),device=self.device,dtype=torch.float)
+                verts.append(verts_)
+                faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
+                faces.append(faces_)
+                meshes = pytorch3d.structures.Meshes(verts, faces)
+                if self.config.improved_depth.debug_save_meshes:
+                    from pytorch3d.io import IO
+                    ptio = IO()
+                    for i,scan_name in enumerate(batch["scan_name"]):
+                        ptio.save_mesh(meshes[i],f"debug/{scan_name}-trimesh-data-pt3d-export-pred.ply")
+                # sample mesh
+                xyz_mesh_samples = pytorch3d.ops.sample_points_from_meshes(meshes,num_samples=self.config.improved_depth.n_samples)
+                # build planar_features
+                plane_reso = self.config.planar_feature_encoder.plane_resolution
+                append_v = self.config.planar_feature_encoder.append_var
+                rgb_imgs = torch.stack(self.keyframe_rgb)
+                poses = torch.stack(self.keyframe_pose)
+                n_imgs, _ , imheight, imwidth = rgb_imgs.shape
+                img_feats = self.cnn2d(rgb_imgs)
+                #img_feats = img_feats.view(batch_size, n_imgs, *img_feats.shape[1:])
+                params ={}
+                params["poses"] = poses[None]
+                params["img_feats"] = img_feats[None]
+                params["K_rgb"] = batch["K_color"][:, None]
+                params["xyz"] = xyz_mesh_samples
+                params["crop_center"] = origin
+                #params["crop_rotation"] = batch["crop_rotation"]
+                params["crop_size_m"] = scale
+                params["rgb_imsize"] = (imheight, imwidth)
+                feature_planes = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build-pc-pred.csv")
+            else:
+                plane_resolution = self.config.planar_feature_encoder.plane_resolution
+                c_dim = self.planar_feature_in_channels//2
+                sparse_point_coords_norm = torch.cat(self.sparse_points_coords_norm,dim=1)
+                sparse_point_feats = torch.cat(self.sparse_points_feats,dim=1)
+                planes = ["xy","xz","yz"]
+                feature_planes = []
+                for i,plane in enumerate(planes):
+                    # convert the sparse points to a unit cube
+                    xy = utils.normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane,range="0:1")
+                    index = utils.coordinate2index(xy, plane_resolution)
+                    fea_plane = sparse_point_feats.new_zeros(1, c_dim, plane_resolution**2)
+                    #c = c.permute(0, 2, 1) # B x 512 x T
+                    fea_plane = scatter_mean(sparse_point_feats.permute(0,2,1), index, out=fea_plane) # B x 512 x reso^2
+                    fea_plane = fea_plane.reshape(1, c_dim, plane_resolution, plane_resolution) # sparce matrix (B x 512 x reso x reso)
+                    if self.config.planar_feature_encoder.append_var:
+                        var_fea_plane = sparse_point_feats.new_zeros(1, c_dim, plane_resolution**2)
+                        var_fea_plane = scatter_std(sparse_point_feats.permute(0,2,1), index, out=var_fea_plane)
+                        var_fea_plane = fea_plane.reshape(1, c_dim, plane_resolution, plane_resolution)
+                        fea_plane = torch.cat([fea_plane,var_fea_plane],dim=1)
+                    # pass through 2D CNN
+                    fea_plane = self.triplane_cnns[i](fea_plane)
+                    feature_planes.append(fea_plane)
         occ_feats = []
-        if self.config.feature_volume.use_2dcnn:
-            occ_feats.append(einops.rearrange(global_feats,"B C W D H -> B C (W D H)"))
-        else:
-            occ_feats.append(global_feats.view(1, global_feats.shape[1], -1))
+        if self.config.feature_volume.enabled:
+            if self.config.feature_volume.use_2dcnn:
+                occ_feats.append(einops.rearrange(global_feats,"B C W D H -> B C (W D H)"))
+            else:
+                occ_feats.append(global_feats.view(1, global_feats.shape[1], -1))
         
         if self.config.planar_feature_encoder.enabled:
             coords = self.global_coords.view(-1, 3).unsqueeze(0)
             coords = coords - batch["gt_origin"][0]
             coords = coords / ((batch["gt_maxbound"][0]) - (batch["gt_origin"][0]))
             # coords is now in the range 0-1
-            coarse_planar_features = utils.sample_planar_features(feature_planes, coords)
+            coarse_planar_features = utils.sample_planar_features(feature_planes, coords,aggregation=self.config.planar_feature_encoder.aggregation)
             occ_feats.append(coarse_planar_features)
 
         occ_feats = torch.cat(occ_feats, dim=1)
         coarse_occ_logits = self.occ_predictor(
                 occ_feats
-            ).view(global_feats.shape[2:])
+            ).view(list(coarse_spatial_dims))
 
         coarse_occ_mask = (coarse_occ_logits > 0) # | True
         coarse_occ_idx = torch.argwhere(coarse_occ_mask)
@@ -822,29 +934,32 @@ class FineRecon(pl.LightningModule):
             chunk_fine_coords += fine_offset[None]
             chunk_fine_coords = chunk_fine_coords.view(-1, 3)
 
-            (
-                chunk_fine_feats,
-                chunk_fine_valid,
-            ) = self.sample_point_features_by_linear_interp(
-                chunk_fine_coords,
-                global_feats,
-                global_valid[None],
-                batch["gt_origin"],
-            )
-            chunk_surface_prediction_feats = [chunk_fine_feats]
+
+            chunk_surface_prediction_feats = []
+            if self.config.feature_volume.enabled:
+                (
+                    chunk_fine_feats,
+                    chunk_fine_valid,
+                ) = self.sample_point_features_by_linear_interp(
+                    chunk_fine_coords,
+                    global_feats,
+                    global_valid[None],
+                    batch["gt_origin"],
+                )
+                chunk_surface_prediction_feats.append(chunk_fine_feats)
 
             if self.perform_point_backprojection:
                 if self.config.point_backprojection.append_var:
                     fine_bp_feats = torch.zeros(
                         (self.total_feats * 2, len(chunk_fine_coords)),
                         device=self.device,
-                        dtype=self.M.dtype,
+                        dtype=torch.float32,
                     )
                 else:
                     fine_bp_feats = torch.zeros(
                         (self.total_feats, len(chunk_fine_coords)),
                         device=self.device,
-                        dtype=self.M.dtype,
+                        dtype=torch.float32,
                     )
 
                 counts = torch.zeros(
@@ -969,11 +1084,10 @@ class FineRecon(pl.LightningModule):
                     extra = fine_tsdf[None]
                     chunk_surface_prediction_feats.append(extra[None])
             if self.config.planar_feature_encoder.enabled:
-                #import ipdb; ipdb.set_trace()
                 coords = chunk_fine_coords[None].clone()
                 coords = coords - batch["gt_origin"][0]
                 coords = coords / ((batch["gt_maxbound"][0]) - (batch["gt_origin"][0]))
-                fine_planar_features = utils.sample_planar_features(feature_planes,coords)
+                fine_planar_features = utils.sample_planar_features(feature_planes,coords,aggregation=self.config.planar_feature_encoder.aggregation)
                 #utils.points_to_csv(chunk_fine_coords[None],f"debug/{batch['scan_name'][0]}-chunk_{coarse_voxel_chunk_start}_fine_coords_.csv")
                 chunk_surface_prediction_feats.append(fine_planar_features)
             
@@ -1121,14 +1235,16 @@ class FineRecon(pl.LightningModule):
         return train_scans, val_scans, test_scans
 
     def train_dataloader(self):
-        train_scans, _, _ = self.get_scans()
+        train_scans, _ , test_scans = self.get_scans()
+        if self.config.debug_scan:
+            train_scans = test_scans
         train_dataset = data.Dataset(
             train_scans,
             self.config.voxel_size,
             self.config.feature_volume.n_voxels,
             self.config.n_views_train,
-            random_translation=True,
-            random_rotation=True,
+            random_translation=False,
+            random_rotation=False,
             random_view_selection=True,
             image_augmentation=True,
             load_depth=True,
@@ -1140,20 +1256,24 @@ class FineRecon(pl.LightningModule):
             batch_size=self.config.batch_size_per_device,
             num_workers=self.config.workers_train,
             persistent_workers=self.config.workers_train > 0,
-            shuffle=True,
+            ################################################################################################################################
+            shuffle=False,
+            ################################################################################################################################
             drop_last=True,
         )
         return train_loader
 
     def val_dataloader(self):
         _, val_scans, test_scans = self.get_scans()
+        if self.config.debug_scan:
+            val_scans = test_scans
         val_dataset = data.Dataset(
             val_scans,
             self.config.voxel_size,
             self.config.feature_volume.n_voxels,
             self.config.n_views_val,
-            random_translation=True,
-            random_rotation=True,
+            random_translation=False,
+            random_rotation=False,
             load_depth=True,
             load_normals=True,
             keyframes_file=self.config.test_keyframes_file,

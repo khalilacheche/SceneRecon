@@ -96,6 +96,10 @@ if __name__ == "__main__":
         max_steps=config.steps,
         log_every_n_steps=50,
         precision=16,
+        #detect_anomaly=(run_name=="test"),
+        #############
+        #num_sanity_val_steps=0,
+        #############
         strategy="ddp" if config.n_devices > 1 else None,
         callbacks=[
             pl.callbacks.ModelCheckpoint(monitor="loss_val/loss", save_top_k=10)

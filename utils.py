@@ -7,9 +7,11 @@ import einops
 import pandas as pd
 
 from torch_scatter import scatter_mean
+from torch_scatter.composite import scatter_std
 
 
 def log_transform(tsdf):
+    tsdf = tsdf + 1e-6 
     result = torch.log(tsdf.abs() + 1)
     result *= torch.sign(tsdf)
     return result
@@ -307,7 +309,7 @@ def normalize_coordinate(p, plane='xz',range="-1:1"):
     else:
         xy = p[:, :, [1, 2]]
     if range == "-1:1":
-        xy_new = (xy / 2) + 1 # -1 -> 1 translated to 0 ->1
+        xy_new = (xy / 2) + 0.5 # -1 -> 1 translated to 0 ->1
     else:
         xy_new = xy
     # f there are outliers out of the range
@@ -338,7 +340,7 @@ def sample_image_feats(uv,imgs):
 
 
 
-def build_triplane_feature_encoder(params,cnns,device,plane_resolution=512,save_points=False,filename="points.csv"):
+def build_triplane_feature_encoder(params,cnns,device,append_var=False,plane_resolution=512,save_points=False,filename="points.csv"):
     poses = params["poses"]
     depth_imgs = params["depth_imgs"]
     img_feats = params["img_feats"]
@@ -374,31 +376,21 @@ def build_triplane_feature_encoder(params,cnns,device,plane_resolution=512,save_
     z = depth_imgs
     x = x * z
     y = y * z # then we get pixel coordinate 
-    xyz_pixel = torch.stack([x,y,z], dim=-1) # 1, 20, 192, 256, 3
+    xyz_pixel = torch.stack([x,y,z], dim=-1) 
     # sample point features for these sparse points
 
     _,_,H,W,_ = xyz_pixel.shape
-
-    # then we calculate the camera coordinate points
     
     xyz_cams = torch.inverse(K_depth) @ xyz_pixel.reshape(B,Nv,H*W,-1).permute(0,1,3,2)
-    # xyz_cams is [1, 3, 983040], add one dim, to make it 4
     xyz_cams = torch.cat([xyz_cams, torch.ones(B,Nv,1,H*W).to(device)], dim=2)
-
-    # xyz_cams
-
-    # then we calculate the world coordinate 
     xyz_world = poses.float() @ xyz_cams
 
-    # NOTE: is the coordinate already normaled? not really, there is shifting and rotation
 
     sparse_point_coords = xyz_world[:,:,:3,:]
     sparse_point_coords = sparse_point_coords.permute(0,1,3,2)
     sparse_point_coords = sparse_point_coords.reshape(B,-1,3)
     c_dim = fine_sparse_point_feats.shape[2]
 
-    # take mean and variance, here I just take mean, after maskin
-    #fine_sparse_point_feats = fine_sparse_point_feats.reshape(B,-1,).permute()
     fine_sparse_point_feats = fine_sparse_point_feats.permute(0,1,3,4,2).reshape(B,-1,c_dim)
     depth_valid = z>0
     depth_valid = depth_valid.unsqueeze(-1).reshape(B,-1,1)
@@ -411,15 +403,26 @@ def build_triplane_feature_encoder(params,cnns,device,plane_resolution=512,save_
 
     valid = valid_in_bound & depth_valid
 
-    if save_points:
-        points_to_csv(sparse_point_coords_norm,filename,valid=valid)
-    #import ipdb;ipdb.set_trace()
-    #sparse_point_coords_norm = sparse_point_coords_norm[valid.repeat(1,1,3)].reshape(B,-1,3)
-    #fine_sparse_point_feats = fine_sparse_point_feats[valid.repeat(1,1,c_dim)].reshape(B,-1,c_dim)
 
     fine_sparse_point_feats = fine_sparse_point_feats * valid
 
-
+    if save_points:
+        xyz = sparse_point_coords_norm.clone()
+        B,N,_ = xyz.shape
+        xyz = xyz.to("cpu").numpy()
+        x = xyz[:,:,0].reshape(B,-1)
+        y = xyz[:,:,1].reshape(B,-1)
+        z = xyz[:,:,2].reshape(B,-1)
+        if valid is not None:
+            p_valid = valid.clone().to("cpu").numpy()
+            p_valid = p_valid.reshape(B,-1)
+        
+        df = pd.DataFrame({"x":x.flatten(),"y":y.flatten(),"z":z.flatten()})
+        if valid is not None:
+            df["valid"] = p_valid.flatten()
+        
+        xys = []
+        indexes = []
     
     planes = ["xy","xz","yz"]
     feature_planes = []
@@ -427,6 +430,9 @@ def build_triplane_feature_encoder(params,cnns,device,plane_resolution=512,save_
         # convert the sparse points to a unit cube
         xy = normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane) # normalize to the range of (0, 1)
         index = coordinate2index(xy, plane_resolution)
+        if save_points:
+            xys.append(xy)
+            indexes.append(index)    
 
         # FIXME: the center is not 0,0
         # scatter plane features from points
@@ -434,28 +440,135 @@ def build_triplane_feature_encoder(params,cnns,device,plane_resolution=512,save_
         #c = c.permute(0, 2, 1) # B x 512 x T
         fea_plane = scatter_mean(fine_sparse_point_feats.permute(0,2,1), index, out=fea_plane) # B x 512 x reso^2
         fea_plane = fea_plane.reshape(B, c_dim, plane_resolution, plane_resolution) # sparce matrix (B x 512 x reso x reso)
+        if append_var:
+            var_fea_plane = fine_sparse_point_feats.new_zeros(B, c_dim, plane_resolution**2)
+            var_fea_plane = scatter_std(fine_sparse_point_feats.permute(0,2,1), index, out=var_fea_plane)
+            var_fea_plane = fea_plane.reshape(B, c_dim, plane_resolution, plane_resolution)
+            fea_plane = torch.cat([fea_plane,var_fea_plane],dim=1)
         # pass through 2D CNN
         fea_plane = cnns[i](fea_plane)
         feature_planes.append(fea_plane)
-
+    if save_points:
+        for i,plane in enumerate(planes):
+            df["index_"+plane] = indexes[i].clone().to("cpu").numpy().reshape(B,-1).flatten()
+            df["u_"+plane] = xys[i][:,:,0].clone().to("cpu").numpy().reshape(B,-1).flatten()
+            df["v_"+plane] = xys[i][:,:,1].clone().to("cpu").numpy().reshape(B,-1).flatten()
+        df.to_csv(filename,index=True)
 
     return feature_planes
 
-def sample_planar_features(planar_features, xyz,params=None,save_points=False,filename="points.csv"):
+def build_planar_feature_encoder_from_pc(params,cnns,device,append_var=False,plane_resolution=512,save_points=False,filename="points.csv"):
+        
+    img_feats = params["img_feats"]
+    K_rgb = params["K_rgb"]
+    crop_center= params["crop_center"]
+    #crop_rotation = params["crop_rotation"]
+    crop_size_m= params["crop_size_m"]
+    sparse_point_coords = params["xyz"]
+    poses = params["poses"]
+    B = img_feats.shape[0]
+
+    rgb_imheight, rgb_imwidth = params["rgb_imsize"]
+    featheight = img_feats.shape[3]
+    featwidth = img_feats.shape[4]
+    K_img_feats = K_rgb.clone()
+    K_img_feats[:, :, 0] *= featwidth / rgb_imwidth
+    K_img_feats[:, :, 1] *= featheight / rgb_imheight
+
+    img_feats, img_feats_valid = sample_posed_images(
+        img_feats,
+        poses,
+        K_img_feats,
+        sparse_point_coords,
+        mode="bilinear",
+        padding_mode="border",
+    )
+    img_feats.masked_fill_(~img_feats_valid[:, :, None], 0)
+    valid_in_views = (img_feats_valid.sum(dim=1)>0)[:,:,None]
+    fine_sparse_point_feats = [img_feats.mean(dim = 1)]
+    if append_var:
+        fine_sparse_point_feats.append(img_feats.var(dim = 1))
+    fine_sparse_point_feats = torch.cat(fine_sparse_point_feats,dim=1)
+    fine_sparse_point_feats = fine_sparse_point_feats.permute(0,2,1) # make fine_sparse_point_feats B N_points C
+    c_dim = fine_sparse_point_feats.shape[2]
+
+    sparse_point_coords_norm = sparse_point_coords - crop_center[:,None]
+    #sparse_point_coords_norm = torch.bmm(sparse_point_coords_norm, crop_rotation.transpose(1,2))
+    sparse_point_coords_norm = sparse_point_coords_norm / crop_size_m[:,None]
+
+    valid_in_bound = (sparse_point_coords_norm<=1) & (sparse_point_coords_norm>=0)
+    valid_in_bound = valid_in_bound.all(dim=-1,keepdim=True)
+
+    valid = valid_in_bound & valid_in_views
+
+
+    fine_sparse_point_feats = fine_sparse_point_feats * valid
+
+    if save_points:
+        xyz = sparse_point_coords_norm.clone()
+        B,N,_ = xyz.shape
+        xyz = xyz.to("cpu").numpy()
+        x = xyz[:,:,0].reshape(B,-1)
+        y = xyz[:,:,1].reshape(B,-1)
+        z = xyz[:,:,2].reshape(B,-1)
+        if valid is not None:
+            p_valid = valid.clone().to("cpu").numpy()
+            p_valid = p_valid.reshape(B,-1)
+        
+        df = pd.DataFrame({"x":x.flatten(),"y":y.flatten(),"z":z.flatten()})
+        if valid is not None:
+            df["valid"] = p_valid.flatten()
+        
+        xys = []
+        indexes = []
+    
+    planes = ["xy","xz","yz"]
+    feature_planes = []
+    for i,plane in enumerate(planes):
+        # convert the sparse points to a unit cube
+        xy = normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane,range="0:1") # normalize to the range of (0, 1)
+        index = coordinate2index(xy, plane_resolution)
+        if save_points:
+            xys.append(xy)
+            indexes.append(index)    
+
+        # FIXME: the center is not 0,0
+        # scatter plane features from points
+        fea_plane = fine_sparse_point_feats.new_zeros(B, c_dim, plane_resolution**2)
+        #c = c.permute(0, 2, 1) # B x 512 x T
+        fea_plane = scatter_mean(fine_sparse_point_feats.permute(0,2,1), index, out=fea_plane) # B x 512 x reso^2
+        fea_plane = fea_plane.reshape(B, c_dim, plane_resolution, plane_resolution) # sparce matrix (B x 512 x reso x reso)
+        if append_var:
+            var_fea_plane = fine_sparse_point_feats.new_zeros(B, c_dim, plane_resolution**2)
+            var_fea_plane = scatter_std(fine_sparse_point_feats.permute(0,2,1), index, out=var_fea_plane)
+            var_fea_plane = fea_plane.reshape(B, c_dim, plane_resolution, plane_resolution)
+            fea_plane = torch.cat([fea_plane,var_fea_plane],dim=1)
+        # pass through 2D CNN
+        fea_plane = cnns[i](fea_plane)
+        feature_planes.append(fea_plane)
+    if save_points:
+        for i,plane in enumerate(planes):
+            df["index_"+plane] = indexes[i].clone().to("cpu").numpy().reshape(B,-1).flatten()
+            df["u_"+plane] = xys[i][:,:,0].clone().to("cpu").numpy().reshape(B,-1).flatten()
+            df["v_"+plane] = xys[i][:,:,1].clone().to("cpu").numpy().reshape(B,-1).flatten()
+        df.to_csv(filename,index=True)
+    return feature_planes
+
+def sample_planar_features(planar_features, xyz,aggregation="concat",params=None,save_points=False,filename="points.csv"):
     if params: 
         # make between -1 and 1
-        crop_center= params["crop_center"]
-        crop_rotation= params["crop_rotation"]
-        crop_size_m= params["crop_size_m"]
+        crop_center = params["crop_center"]
+        #crop_rotation= params["crop_rotation"]
+        crop_size_m = params["crop_size_m"]
         xyz_norm = xyz - crop_center[:,None]
-        xyz_norm = torch.bmm(xyz_norm, crop_rotation.transpose(1,2))
+        #xyz_norm = torch.bmm(xyz_norm, crop_rotation.transpose(1,2))
         xyz_norm = xyz_norm / crop_size_m[:,None]
+        #xyz_norm = xyz_norm * 2 
     else: 
         # assume xyz is between 0 and 1
         xyz_norm = ((xyz*2) - 1) # make uv between -1,1, for grid_sample
     if save_points:
         points_to_csv(xyz_norm,filename)
-
     planes = ["xy","xz","yz"]
     xyz_feats = []
     for plane,plane_features in zip(planes,planar_features):
@@ -468,6 +581,27 @@ def sample_planar_features(planar_features, xyz,params=None,save_points=False,fi
         xyz_feats_plane = torch.nn.functional.grid_sample(plane_features, xy[:,None], mode='bilinear', padding_mode='zeros', align_corners=False)
         xyz_feats_plane = xyz_feats_plane.squeeze(2)
         xyz_feats.append(xyz_feats_plane)
-    xyz_feats = torch.cat(xyz_feats,dim=1)
+    if aggregation == "concat":
+        xyz_feats = torch.cat(xyz_feats,dim=1)
+    elif aggregation == "mean_var":
+        mean_xyz_feats = torch.mean(torch.stack(xyz_feats,dim=1), dim=1)
+        var_xyz_feats = torch.var(torch.stack(xyz_feats,dim=1),dim=1)
+        xyz_feats = torch.cat([mean_xyz_feats,var_xyz_feats],dim=1)
+    elif aggregation == "dot_prod":
+        B,c,n = xyz_feats[0].shape
+        dot_product = []
+        partial_dot_product = torch.bmm(xyz_feats[0].view(B*n,1,c),xyz_feats[1].view(B*n,c,1))
+        dot_product.append(partial_dot_product.view(B,1,-1))
+        partial_dot_product = torch.bmm(xyz_feats[1].view(B*n,1,c),xyz_feats[2].view(B*n,c,1))
+        dot_product.append(partial_dot_product.view(B,1,-1))
+        partial_dot_product = torch.bmm(xyz_feats[2].view(B*n,1,c),xyz_feats[0].view(B*n,c,1))
+        dot_product.append(partial_dot_product.view(B,1,-1))
+        xyz_feats = torch.cat(dot_product,dim=1)
+    elif aggregation == "hadamard_prod":
+        partial_had_product = xyz_feats[0].mul(xyz_feats[1])
+        xyz_feats = partial_had_product.mul(xyz_feats[2])
+    else:
+        xyz_feats = torch.cat(xyz_feats,dim=1) # concat as default
+        
     return xyz_feats
 

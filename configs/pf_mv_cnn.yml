@@ -1,9 +1,9 @@
-offline_logging: True
+offline_logging: False
 
 improved_tsdf_sampling: True
 
 
-debug_scan: True
+debug_scan: False
 
 depth_guidance:
   pred_depth_dir:  "/scratch/students/2023-fall-acheche/data/scannet_simplerecon/outputs/converted_depth_est"
@@ -44,7 +44,7 @@ improved_depth:
   n_samples: 1_000_000
   debug_save_meshes: False
   
-save_train_mesh: True
+  
 
 
 n_views_train: 20

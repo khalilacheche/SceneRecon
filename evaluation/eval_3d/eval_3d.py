@@ -1,4 +1,5 @@
 import sys, os
+import json
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 sys.path.insert(0, "/scratch/students/2023-fall-acheche/")
@@ -123,129 +124,144 @@ def evaluate(prediction_dir,verbose=False):
     scene_ids = sorted(os.listdir(groundtruth_dir))
     
     for scene_id in tqdm(scene_ids):
-        # Load predicted mesh.
-        missing_scene = False
-        mesh_pred_path = os.path.join(prediction_dir, "{}.ply".format(scene_id))
-        if not os.path.exists(mesh_pred_path):
-            # We have no extracted geometry, so we use default metrics for missing scene.
-            missing_scene = True
-
-        else:
-            mesh_pred = o3d.io.read_triangle_mesh(mesh_pred_path)
-            if np.asarray(mesh_pred.vertices).shape[0] <= 0 or np.asarray(mesh_pred.triangles).shape[0] <= 0:
-                # No vertices or faces present.
+        try:
+            # Load predicted mesh.
+            missing_scene = False
+            mesh_pred_path = os.path.join(prediction_dir, "{}.ply".format(scene_id))
+            if not os.path.exists(mesh_pred_path):
+                # We have no extracted geometry, so we use default metrics for missing scene.
                 missing_scene = True
 
-        # If no result is present for the scene, we use the maximum errors.
-        if missing_scene:
-            # We use default metrics for missing scene.
-            print("Missing scene reconstruction: {0}".format(mesh_pred_path))
-            acc_sum += max_dist
-            compl_sum += max_dist
-            chamfer_sum += max_dist
-            prc_sum += 1.0
-            rec_sum += 0.0
-            f1_score_sum += 0.0
-            
-            total_num_scenes += 1
-            continue
+            else:
+                mesh_pred = o3d.io.read_triangle_mesh(mesh_pred_path)
+                if np.asarray(mesh_pred.vertices).shape[0] <= 0 or np.asarray(mesh_pred.triangles).shape[0] <= 0:
+                    # No vertices or faces present.
+                    missing_scene = True
 
-        # Load groundtruth mesh.
-        mesh_gt_path = os.path.join(groundtruth_dir, scene_id, "mesh_gt.ply".format(scene_id))
+            # If no result is present for the scene, we use the maximum errors.
+            if missing_scene:
+                # We use default metrics for missing scene.
+                print("Missing scene reconstruction: {0}".format(mesh_pred_path))
+                acc_sum += max_dist
+                compl_sum += max_dist
+                chamfer_sum += max_dist
+                prc_sum += 1.0
+                rec_sum += 0.0
+                f1_score_sum += 0.0
+                
+                total_num_scenes += 1
+                continue
 
-        mesh_gt = o3d.io.read_triangle_mesh(mesh_gt_path)
-        points_gt = np.asarray(mesh_gt.vertices)
+            # Load groundtruth mesh.
+            mesh_gt_path = os.path.join(groundtruth_dir, scene_id, "mesh_gt.ply".format(scene_id))
 
-        # To have a fair comparison even in the case of different mesh resolutions,
-        # we always sample consistent amount of points on predicted mesh.
-        pcd_pred = mesh_pred.sample_points_uniformly(number_of_points=num_points_samples)
-        points_pred = np.asarray(pcd_pred.points)
+            mesh_gt = o3d.io.read_triangle_mesh(mesh_gt_path)
+            points_gt = np.asarray(mesh_gt.vertices)
 
-        # Load occlusion mask grid, with world2grid transform.
-        occlusion_mask_path = os.path.join(groundtruth_dir, scene_id, "occlusion_mask.npy")
-        occlusion_mask = np.load(occlusion_mask_path)
+            # To have a fair comparison even in the case of different mesh resolutions,
+            # we always sample consistent amount of points on predicted mesh.
+            pcd_pred = mesh_pred.sample_points_uniformly(number_of_points=num_points_samples)
+            points_pred = np.asarray(pcd_pred.points)
 
-        world2grid_path = os.path.join(groundtruth_dir, scene_id, "world2grid.txt")
-        world2grid = np.loadtxt(world2grid_path)
+            # Load occlusion mask grid, with world2grid transform.
+            occlusion_mask_path = os.path.join(groundtruth_dir, scene_id, "occlusion_mask.npy")
+            occlusion_mask = np.load(occlusion_mask_path)
 
-        # Put data to device memory.
-        points_pred = torch.from_numpy(points_pred).float().cuda()
-        points_gt = torch.from_numpy(points_gt).float().cuda()
-        world2grid = torch.from_numpy(world2grid).float().cuda()
+            world2grid_path = os.path.join(groundtruth_dir, scene_id, "world2grid.txt")
+            world2grid = np.loadtxt(world2grid_path)
 
-        # We keep occlusion mask on host memory, since it can be very large for big scenes.
-        occlusion_mask = torch.from_numpy(occlusion_mask).float()
+            # Put data to device memory.
+            points_pred = torch.from_numpy(points_pred).float().cuda()
+            points_gt = torch.from_numpy(points_gt).float().cuda()
+            world2grid = torch.from_numpy(world2grid).float().cuda()
 
-        # Compute gt -> predicted distance.
-        dist2_gt2pred, _ = chamfer_dist(points_gt.unsqueeze(0), points_pred.unsqueeze(0))
-    
-        dist_gt2pred = torch.sqrt(dist2_gt2pred)
-        dist_gt2pred[~torch.isfinite(dist_gt2pred)] = 0.0 # sqrt() operation is undefined for distance == 0
+            # We keep occlusion mask on host memory, since it can be very large for big scenes.
+            occlusion_mask = torch.from_numpy(occlusion_mask).float()
 
-        dist_gt2pred = torch.minimum(dist_gt2pred, max_dist * torch.ones_like(dist_gt2pred))
-
-        # Compute predicted -> gt distance.
-        # All occluded predicted points should be masked out for , to not
-        # penalize completion beyond groundtruth. 
-        points_pred_visible = filter_occluded_points(points_pred, world2grid, occlusion_mask)
-
-        if points_pred_visible.shape[0] > 0:
-            dist2_pred2gt, _ = chamfer_dist(points_pred_visible.unsqueeze(0), points_gt.unsqueeze(0))
+            # Compute gt -> predicted distance.
+            dist2_gt2pred, _ = chamfer_dist(points_gt.unsqueeze(0), points_pred.unsqueeze(0))
         
-            dist_pred2gt = torch.sqrt(dist2_pred2gt)
-            dist_pred2gt[~torch.isfinite(dist_pred2gt)] = 0.0 # sqrt() operation is undefined for distance == 0
+            dist_gt2pred = torch.sqrt(dist2_gt2pred)
+            dist_gt2pred[~torch.isfinite(dist_gt2pred)] = 0.0 # sqrt() operation is undefined for distance == 0
 
-            dist_pred2gt = torch.minimum(dist_pred2gt, max_dist * torch.ones_like(dist_pred2gt))
+            dist_gt2pred = torch.minimum(dist_gt2pred, max_dist * torch.ones_like(dist_gt2pred))
 
-        # Geometry accuracy/completion/Chamfer.
-        if points_pred_visible.shape[0] > 0:
-            acc = torch.mean(dist_pred2gt).item() 
-        else:
-            acc = max_dist
+            # Compute predicted -> gt distance.
+            # All occluded predicted points should be masked out for , to not
+            # penalize completion beyond groundtruth. 
+            points_pred_visible = filter_occluded_points(points_pred, world2grid, occlusion_mask)
 
-        compl = torch.mean(dist_gt2pred).item()
-        chamfer = 0.5 * (acc + compl)
-
-        # Precision/recall/F1 score.
-        if points_pred_visible.shape[0] > 0:
-            prc = (dist_pred2gt <= dist_threshold).float().mean().item()
-        else:
-            prc = 0.0
+            if points_pred_visible.shape[0] > 0:
+                dist2_pred2gt, _ = chamfer_dist(points_pred_visible.unsqueeze(0), points_gt.unsqueeze(0))
             
-        rec = (dist_gt2pred <= dist_threshold).float().mean().item()
+                dist_pred2gt = torch.sqrt(dist2_pred2gt)
+                dist_pred2gt[~torch.isfinite(dist_pred2gt)] = 0.0 # sqrt() operation is undefined for distance == 0
 
-        if prc + rec > 0:
-            f1_score = 2 * prc * rec / (prc + rec)
-        else:
-            f1_score = 0.0
+                dist_pred2gt = torch.minimum(dist_pred2gt, max_dist * torch.ones_like(dist_pred2gt))
 
-        # print("acc =", acc)
-        # print("compl =", compl)
-        # print("chamfer =", chamfer)
-        # print("prc =", prc)
-        # print("rec =", rec)
-        # print("f1_score =", f1_score)
+            # Geometry accuracy/completion/Chamfer.
+            if points_pred_visible.shape[0] > 0:
+                acc = torch.mean(dist_pred2gt).item() 
+            else:
+                acc = max_dist
 
-        # Update total metrics.
-        acc_sum += acc
-        compl_sum += compl
-        chamfer_sum += chamfer
-        prc_sum += prc
-        rec_sum += rec
-        f1_score_sum += f1_score
+            compl = torch.mean(dist_gt2pred).item()
+            chamfer = 0.5 * (acc + compl)
 
-        total_num_scenes += 1
+            # Precision/recall/F1 score.
+            if points_pred_visible.shape[0] > 0:
+                prc = (dist_pred2gt <= dist_threshold).float().mean().item()
+            else:
+                prc = 0.0
+                
+            rec = (dist_gt2pred <= dist_threshold).float().mean().item()
 
-        # Update scene stats.
-        scene_stats.append({
-            "scene_id": scene_id,
-            "acc": acc,
-            "compl": compl,
-            "chamfer": chamfer,
-            "prc": prc,
-            "rec": rec,
-            "f1_score": f1_score
-        })
+            if prc + rec > 0:
+                f1_score = 2 * prc * rec / (prc + rec)
+            else:
+                f1_score = 0.0
+
+            scene_met = {
+                "scene_id": scene_id,
+                "acc": acc,
+                "compl": compl,
+                "chamfer": chamfer,
+                "prc": prc,
+                "rec": rec,
+                "f1_score": f1_score
+            }
+            rslt_file = os.path.join(prediction_dir, '%s_metrics_3d.json'%scene_id)
+            json.dump(scene_met, open(rslt_file, 'w'))
+            # print("acc =", acc)
+            # print("compl =", compl)
+            # print("chamfer =", chamfer)
+            # print("prc =", prc)
+            # print("rec =", rec)
+            # print("f1_score =", f1_score)
+
+            # Update total metrics.
+            acc_sum += acc
+            compl_sum += compl
+            chamfer_sum += chamfer
+            prc_sum += prc
+            rec_sum += rec
+            f1_score_sum += f1_score
+
+            total_num_scenes += 1
+
+            # Update scene stats.
+            scene_stats.append({
+                "scene_id": scene_id,
+                "acc": acc,
+                "compl": compl,
+                "chamfer": chamfer,
+                "prc": prc,
+                "rec": rec,
+                "f1_score": f1_score
+            })
+        except Exception as e:
+            print("error for scene",scene_id,e)
+            continue 
 
         # Just for debugging: Visualize occluded points.
         # occluded_pcd = o3d.geometry.PointCloud()

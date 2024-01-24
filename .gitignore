@@ -1,3 +1,4 @@
 save_dir/
 debug/
 __pycache__/
+*.pyc

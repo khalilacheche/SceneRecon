@@ -1,4 +1,4 @@
-offline_logging: False
+offline_logging: True
 
 improved_tsdf_sampling: True
 
@@ -46,7 +46,7 @@ finetune_steps: 10_000
 workers_train: 8
 workers_val: 8
 workers_predict: 8
-batch_size_per_device: 2
+batch_size_per_device: 1
 val_batch_size_per_device: 1
 
 

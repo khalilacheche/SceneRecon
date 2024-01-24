@@ -2,8 +2,7 @@ offline_logging: True
 
 improved_tsdf_sampling: True
 
-
-debug_scan: True
+debug_scan: False
 
 depth_guidance:
   pred_depth_dir:  "/scratch/students/2023-fall-acheche/data/scannet_simplerecon/outputs/converted_depth_est"
@@ -19,7 +18,7 @@ test_keyframes_file: "/scratch/students/2023-fall-acheche/ml-finerecon/keyframes
 # Parameters
 img_feature_dim: 20
 voxel_size: 0.02
-output_sample_rate: 1
+output_sample_rate: 2
 
 feature_volume:
   enabled: True
@@ -41,10 +40,8 @@ planar_feature_encoder:
 improved_depth:
   enabled: False
   #resolution: 512
-  n_samples: 1_000_000
+  n_samples: 100_000
   debug_save_meshes: False
-  
-save_train_mesh: True
 
 
 n_views_train: 20

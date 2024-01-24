@@ -91,6 +91,7 @@ def process(info_file, save_path, total_scenes_index, total_scenes_count):
     temp = TSDF.load(file_tsdf_pred)
     voxel_size = int(temp.voxel_size*100)
 
+    #import ipdb; ipdb.set_trace()
 
     # eval tsdf
     file_tsdf_trgt = dataset.info['file_name_vol_%02d'%voxel_size]
@@ -145,7 +146,6 @@ def process(info_file, save_path, total_scenes_index, total_scenes_count):
     # save trimed mesh
     file_mesh_trim = os.path.join(save_path, '%s_trim.ply'%scene)
     tsdf_fusion.get_tsdf().get_mesh().export(file_mesh_trim)
-
     # eval tsdf
     file_tsdf_trgt = dataset.info['file_name_vol_%02d'%voxel_size]
     metrics_tsdf = eval_tsdf(file_tsdf_pred, file_tsdf_trgt)
@@ -186,7 +186,7 @@ def evaluate(prediction_dir):
     scenes = [scene.split(".")[0] for scene in scenes if scene.endswith(".ply")]
     scenes = sorted(scenes)
     info_files = [os.path.join(meta_path, scene, 'info.json') 
-            for scene in scenes]
+            for scene in scenes if os.path.exists(os.path.join(meta_path, scene, 'info.json'))]
     metrics = {}
     for i, info_file in enumerate(info_files):
         scene, temp = process(info_file, prediction_dir, i, len(info_files))

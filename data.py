@@ -57,6 +57,23 @@ def get_scans(dataset_dir, tsdf_dir, pred_depth_dir,pred_normal_dir):
                 pass
     return train_scans, val_scans, test_scans
 
+def get_scan(scan_name,dataset_dir, tsdf_dir, pred_depth_dir,pred_normal_dir):
+    tsdf_npzfile = os.path.join(tsdf_dir, f"{scan_name}.npz")
+    zero_crossings_npzfile = os.path.join(tsdf_dir, f"{scan_name}_zc.npz")
+    pose_npyfile = os.path.join(dataset_dir, scan_name, "pose.npy")
+    image_dir = os.path.join(dataset_dir, scan_name, "color")
+    scan = {
+        "scan_dir": os.path.join(dataset_dir, scan_name),
+        "scan_name": scan_name,
+        "tsdf_npzfile": tsdf_npzfile,
+        "zero_crossings_npzfile": zero_crossings_npzfile,
+        "pose_npyfile": pose_npyfile,
+        "image_dir": image_dir,
+        "pred_depth_dir": os.path.join(pred_depth_dir, scan_name),
+        "pred_normals_dir": os.path.join(pred_normal_dir,scan_name)
+    }
+
+    return scan
 
 def load_scan(scan, keyframes_file=None):
     scan_dir = scan["scan_dir"]
@@ -573,14 +590,13 @@ class Dataset(torch.utils.data.Dataset):
         y_idx = torch.arange(min_idx[1], max_idx[1], dtype=torch.long)
         z_idx = torch.arange(min_idx[2], max_idx[2], dtype=torch.long)
         xx, yy, zz = torch.meshgrid(x_idx, y_idx, z_idx, indexing="ij")
-
         idxs = torch.stack((xx, yy, zz), dim=-1).view(-1, 3)
+        original_shape = torch.stack((xx, yy, zz), dim=-1).shape
 
         bad_idxs = torch.any(
             (idxs < 0) | (idxs >= torch.tensor(gt_tsdf.shape)), dim=-1
         )
         idxs = idxs[~bad_idxs]
-
         gt_tsdf = gt_tsdf[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
         gt_occ = gt_occ[idxs[:, 0], idxs[:, 1], idxs[:, 2]]
         output_coords = idxs * gt_voxel_size + gt_origin
@@ -591,7 +607,7 @@ class Dataset(torch.utils.data.Dataset):
         gt_tsdf = gt_tsdf[idx]
         gt_occ = gt_occ[idx]
 
-        nsample = torch.div(torch.prod(self.crop_size_nvox), 4,rounding_mode="trunc")
+        nsample = len(gt_tsdf) #torch.div(torch.prod(self.crop_size_nvox), 4,rounding_mode="trunc")
         if len(gt_tsdf) < nsample:
             print(
                 f"resampling ({len(gt_tsdf)} / {nsample})",
@@ -599,15 +615,22 @@ class Dataset(torch.utils.data.Dataset):
             )
             return self[np.random.choice(len(self))]
 
-        idx = np.random.choice(len(gt_tsdf), size=int(nsample), replace=False)
+        result["oc_all"] = output_coords
+        result["oc_all_idx"] = idx
+        result["gt_tsdf_all"] = gt_tsdf
+        result["gt_occ_all"] = gt_occ
 
+        idx = np.random.choice(len(gt_tsdf), size=int(nsample), replace=False)
         output_coords = output_coords[idx]
         gt_tsdf = gt_tsdf[idx]
         gt_occ = gt_occ[idx]
+        
 
         result["output_coords"] = output_coords
         result["gt_tsdf"] = gt_tsdf
         result["gt_occ"] = gt_occ
         result["input_coords"] = input_coords
-
+        result["oc_idx"] = idx
+        result["oc_shape"] = original_shape
+        
         return result

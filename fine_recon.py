@@ -265,6 +265,9 @@ class FineRecon(pl.LightningModule):
 
 
         if self.config.planar_feature_encoder.enabled:
+            min_bound = batch["output_coords"].min(dim=1)[0]
+            max_bound = batch["output_coords"].max(dim=1)[0]
+            scale = (max_bound - min_bound) / 2 # /2 because the center is 0.5,0.5,0.5 (in middle not corner)
             if self.config.improved_depth.enabled:
                 params={}
                 # build mesh from tsdf
@@ -272,7 +275,7 @@ class FineRecon(pl.LightningModule):
                 faces = []
                 ## potential bottlneck
                 for i in range(batch_size):
-                    tsdf_b = tsdf[i]; weight_b = weight[i] ; origin = batch["crop_center"][i]
+                    tsdf_b = tsdf[i]; weight_b = weight[i] ; origin = batch["crop_center"][i] - batch["crop_size_m"][i]/2
                     mask = weight_b > 0
                     mask = mask.cpu().numpy()
                     verts_, faces_, _, _ = skimage.measure.marching_cubes(tsdf_b.clone().cpu().numpy(), level=0.5 ,mask=mask)
@@ -283,19 +286,11 @@ class FineRecon(pl.LightningModule):
                     faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
                     faces.append(faces_)
                 meshes = pytorch3d.structures.Meshes(verts, faces)
-                if self.config.improved_depth.debug_save_meshes:
-                    from pytorch3d.io import IO
-                    ptio = IO()
-                    for i,scan_name in enumerate(batch["scan_name"]):
-                        ptio.save_mesh(meshes[i],f"debug/{scan_name}-trimesh-data-pt3d-export.ply")
                 # sample mesh
                 xyz_mesh_samples = pytorch3d.ops.sample_points_from_meshes(meshes,num_samples=self.config.improved_depth.n_samples)
                 # build planar_features
                 plane_reso = self.config.planar_feature_encoder.plane_resolution
                 append_v = self.config.planar_feature_encoder.append_var
-                # save xyz_mesh_samples and batch["output_coords"]
-                #utils.points_to_csv(xyz_mesh_samples,f"debug/{batch['scan_name'][0]}_xyz_mesh_samples.csv")
-                #utils.points_to_csv(batch["output_coords"],f"debug/{batch['scan_name'][0]}_output_coords.csv")
 
                 params ={}
                 params["poses"] = batch["poses"]
@@ -304,11 +299,12 @@ class FineRecon(pl.LightningModule):
                 params["xyz"] = xyz_mesh_samples
                 params["crop_center"] = batch["crop_center"]
                 params["crop_rotation"] = batch["crop_rotation"]
-                params["crop_size_m"] = batch["crop_size_m"]
+                
+                params["crop_size_m"] = scale
                 params["rgb_imsize"] = rgb_imsize
                 params["poses"] = batch["poses"]
-                #import ipdb;ipdb.set_trace()
-                planar_features = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build-pc.csv")
+
+                planar_features = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/xyz_norm_{batch['scan_name'][0]}_build_pc.csv")
 
             else:
                 params ={}
@@ -321,10 +317,10 @@ class FineRecon(pl.LightningModule):
                 params["K_normal"] = batch["K_pred_normal"][:, None]
                 params["crop_center"] = batch["crop_center"]
                 params["crop_rotation"] = batch["crop_rotation"]
-                params["crop_size_m"] = batch["crop_size_m"]
+                params["crop_size_m"] = scale
                 plane_reso = self.config.planar_feature_encoder.plane_resolution
                 append_v = self.config.planar_feature_encoder.append_var
-                planar_features = utils.build_triplane_feature_encoder(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build.csv")
+                planar_features = utils.build_triplane_feature_encoder(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/xyz_norm_{batch['scan_name'][0]}_build.csv")
 
         
 
@@ -395,8 +391,7 @@ class FineRecon(pl.LightningModule):
                 tsdf.masked_fill_(weight == 0, 1)
                 surface_prediction_feats.append(tsdf[:, None])
         if self.config.planar_feature_encoder.enabled:
-            #import ipdb; ipdb.set_trace()
-            fine_planar_features = utils.sample_planar_features(planar_features,batch["output_coords"],params=params,aggregation=self.config.planar_feature_encoder.aggregation)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-sample-pc.csv")
+            fine_planar_features = utils.sample_planar_features(planar_features,batch["output_coords"],params=params,aggregation=self.config.planar_feature_encoder.aggregation)#,save_points=True,filename=f"debug/xyz_norm_{batch['scan_name'][0]}_sample.csv")
             surface_prediction_feats.append(fine_planar_features)
             occupancy_prediction_feats.append(fine_planar_features)
 
@@ -407,6 +402,11 @@ class FineRecon(pl.LightningModule):
         tsdf_logits = self.surface_predictor(surface_prediction_feats).squeeze(1)
         occ_logits = self.occ_predictor(occupancy_prediction_feats).squeeze(1)
 
+        
+
+
+
+
         loss, tsdf_loss, occ_loss = self.compute_loss(
             tsdf_logits,
             occ_logits,
@@ -415,6 +415,49 @@ class FineRecon(pl.LightningModule):
             occupancy_mask,
             surface_prediction_mask,
         )
+        if self.config.save_train_mesh:
+
+            #import ipdb; ipdb.set_trace()
+            oc_idx = batch["oc_idx"]
+            oc_shape = batch["oc_shape"]
+            oc_shape = (int(oc_shape[0]),int(oc_shape[1]),int(oc_shape[2]))
+            
+            occ_loss_mask = (~batch["gt_occ"].isnan()) & occupancy_mask
+            tsdf_loss_mask = (batch["gt_occ"] > 0.5) & (~batch["gt_tsdf"].isnan()) & surface_prediction_mask
+            mask = torch.zeros(oc_shape).bool()
+            mask.view(-1)[oc_idx] = (occ_loss_mask.cpu() & tsdf_loss_mask.cpu())
+
+            export_tsdf = torch.ones(oc_shape)
+
+            tsdf_ = utils.log_transform(torch.tanh(tsdf_logits.cpu().float()))
+            export_tsdf.view(-1)[oc_idx] = tsdf_ # or batch["gt_tsdf"]
+
+            verts_, faces_, _, _ = skimage.measure.marching_cubes(export_tsdf.detach().cpu().numpy(), level=0.5 ,mask=mask.numpy())
+            faces_ = faces_[~np.any(np.isnan(verts_[faces_]), axis=(1, 2))]
+            verts_ = torch.tensor(verts_.copy(),device=self.device,dtype=torch.float)
+            faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
+            meshes = pytorch3d.structures.Meshes([verts_], [faces_])
+            from pytorch3d.io import IO
+            ptio = IO()
+            ptio.save_mesh(meshes,f"debug/{batch['scan_name'][0]}_train_{loss:.2f}.ply")
+
+
+            export_tsdf = torch.ones(oc_shape)
+
+            tsdf_ = utils.log_transform(batch["gt_tsdf"].cpu().float())
+            export_tsdf.view(-1)[oc_idx] = tsdf_ # or batch["gt_tsdf"]
+            
+            verts_, faces_, _, _ = skimage.measure.marching_cubes(export_tsdf.numpy(), level=0.5 ,mask=mask.numpy())
+            faces_ = faces_[~np.any(np.isnan(verts_[faces_]), axis=(1, 2))]
+            verts_ = torch.tensor(verts_.copy(),device=self.device,dtype=torch.float)
+            faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
+            meshes = pytorch3d.structures.Meshes([verts_], [faces_])
+            from pytorch3d.io import IO
+            ptio = IO()
+            ptio.save_mesh(meshes,f"debug/{batch['scan_name'][0]}_train_{loss:.2f}_gt.ply")
+
+
+            #utils.log_transform(gt_tsdf[tsdf_loss_mask])
         outputs = {
             "loss": loss,
             "tsdf_loss": tsdf_loss,
@@ -773,8 +816,6 @@ class FineRecon(pl.LightningModule):
                 verts = []
                 faces = []
                 ## potential bottlneck
-                
-                scale = (batch["gt_maxbound"] - batch["gt_origin"])
                 mask = weight_b > 0
                 mask = mask.cpu().numpy()
                 verts_, faces_, _, _ = skimage.measure.marching_cubes(tsdf_b.clone().cpu().numpy(), level=0.5 ,mask=mask)
@@ -785,11 +826,6 @@ class FineRecon(pl.LightningModule):
                 faces_ = torch.tensor(faces_.copy(),device=self.device,dtype=torch.long)
                 faces.append(faces_)
                 meshes = pytorch3d.structures.Meshes(verts, faces)
-                if self.config.improved_depth.debug_save_meshes:
-                    from pytorch3d.io import IO
-                    ptio = IO()
-                    for i,scan_name in enumerate(batch["scan_name"]):
-                        ptio.save_mesh(meshes[i],f"debug/{scan_name}-trimesh-data-pt3d-export-pred.ply")
                 # sample mesh
                 xyz_mesh_samples = pytorch3d.ops.sample_points_from_meshes(meshes,num_samples=self.config.improved_depth.n_samples)
                 # build planar_features
@@ -799,21 +835,20 @@ class FineRecon(pl.LightningModule):
                 poses = torch.stack(self.keyframe_pose)
                 n_imgs, _ , imheight, imwidth = rgb_imgs.shape
                 img_feats = self.cnn2d(rgb_imgs)
-                #img_feats = img_feats.view(batch_size, n_imgs, *img_feats.shape[1:])
                 params ={}
                 params["poses"] = poses[None]
                 params["img_feats"] = img_feats[None]
                 params["K_rgb"] = batch["K_color"][:, None]
                 params["xyz"] = xyz_mesh_samples
                 params["crop_center"] = origin
-                #params["crop_rotation"] = batch["crop_rotation"]
-                params["crop_size_m"] = scale
+                params["crop_size_m"] = (batch["gt_maxbound"] - batch["gt_origin"])
                 params["rgb_imsize"] = (imheight, imwidth)
-                feature_planes = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso)#,save_points=True,filename=f"debug/{batch['scan_name'][0]}-build-pc-pred.csv")
+                feature_planes = utils.build_planar_feature_encoder_from_pc(params,self.triplane_cnns,self.device,append_v,plane_reso,range="0:1")#,save_points=True,filename=f"debug/xyz_norm_{batch['scan_name'][0]}_build_pc_pred.csv")
             else:
                 plane_resolution = self.config.planar_feature_encoder.plane_resolution
                 c_dim = self.planar_feature_in_channels//2
                 sparse_point_coords_norm = torch.cat(self.sparse_points_coords_norm,dim=1)
+                #utils.points_to_csv(sparse_point_coords_norm,f"debug/xyz_norm_{batch['scan_name'][0]}_build_pred.csv")
                 sparse_point_feats = torch.cat(self.sparse_points_feats,dim=1)
                 planes = ["xy","xz","yz"]
                 feature_planes = []
@@ -1113,6 +1148,8 @@ class FineRecon(pl.LightningModule):
         fine_surface *= 0.5
         fine_surface += 0.5
 
+        fine_surface[fine_surface.isnan()] = 1
+
         if self.config.do_prediction_timing:
             torch.cuda.synchronize()
             t1 = time.time()
@@ -1206,6 +1243,12 @@ class FineRecon(pl.LightningModule):
             "keyframe",
             "initial_frame",
             "final_frame",
+            "oc_idx",
+            "oc_shape",
+            "oc_all",
+            "oc_all_idx",
+            "gt_tsdf_all",
+            "gt_occ_all"
         ]
 
         transfer_batch = {}
@@ -1256,9 +1299,7 @@ class FineRecon(pl.LightningModule):
             batch_size=self.config.batch_size_per_device,
             num_workers=self.config.workers_train,
             persistent_workers=self.config.workers_train > 0,
-            ################################################################################################################################
-            shuffle=False,
-            ################################################################################################################################
+            shuffle=True,
             drop_last=True,
         )
         return train_loader
@@ -1290,7 +1331,16 @@ class FineRecon(pl.LightningModule):
         _, _, test_scans = self.get_scans()
 
         if first_scan_only:
-            test_scans = test_scans[:1]
+            test_scans = test_scans[:1] 
+        if self.config.scene_id:
+            test_scans = [data.get_scan(
+            self.config.scene_id,
+            self.config.dataset_dir,
+            self.config.tsdf_dir,
+            self.dg.pred_depth_dir,
+            self.config.normals_dir)]
+
+
 
         predict_dataset = data.InferenceDataset(
             test_scans,

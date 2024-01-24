@@ -39,10 +39,11 @@ def zip_code(save_dir,config_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--task", default="train", choices=["train", "predict", "find_lr"]
+        "--task", default="train", choices=["train", "predict", "find_lr"],
     )
     parser.add_argument("--resume",action='store_true')
     parser.add_argument("--run_name")
+    parser.add_argument("--scene")
     args = parser.parse_args()
 
 
@@ -106,7 +107,7 @@ if __name__ == "__main__":
         ],
     )
     
-
+    config.scene_id = args.scene
     if args.task == "train":
         trainer.fit(model, ckpt_path=ckpt_path)
 
@@ -120,6 +121,7 @@ if __name__ == "__main__":
         fig.savefig("lr.png")
 
     elif args.task == "predict":
+        
         trainer.predict(model, ckpt_path=ckpt_path)
     else:
         raise NotImplementedError

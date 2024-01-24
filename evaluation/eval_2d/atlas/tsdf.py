@@ -260,7 +260,7 @@ class TSDF():
         if origin is None:
             origin = old_origin
         else:
-            origin = torch.tensor(origin, dtype=torch.float, device=device).view(1,3)
+            origin = torch.tensor(origin.clone().detach(), dtype=torch.float, device=device).view(1,3)
 
         coords = coordinates(voxel_dim, device)
         world = coords.type(torch.float) * self.voxel_size + origin.T

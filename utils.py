@@ -457,7 +457,7 @@ def build_triplane_feature_encoder(params,cnns,device,append_var=False,plane_res
 
     return feature_planes
 
-def build_planar_feature_encoder_from_pc(params,cnns,device,append_var=False,plane_resolution=512,save_points=False,filename="points.csv"):
+def build_planar_feature_encoder_from_pc(params,cnns,device,append_var=False,plane_resolution=512,range="-1:1",save_points=False,filename="points.csv"):
         
     img_feats = params["img_feats"]
     K_rgb = params["K_rgb"]
@@ -496,7 +496,7 @@ def build_planar_feature_encoder_from_pc(params,cnns,device,append_var=False,pla
     #sparse_point_coords_norm = torch.bmm(sparse_point_coords_norm, crop_rotation.transpose(1,2))
     sparse_point_coords_norm = sparse_point_coords_norm / crop_size_m[:,None]
 
-    valid_in_bound = (sparse_point_coords_norm<=1) & (sparse_point_coords_norm>=0)
+    valid_in_bound = (sparse_point_coords_norm<=1) & (sparse_point_coords_norm>=-1)
     valid_in_bound = valid_in_bound.all(dim=-1,keepdim=True)
 
     valid = valid_in_bound & valid_in_views
@@ -526,7 +526,7 @@ def build_planar_feature_encoder_from_pc(params,cnns,device,append_var=False,pla
     feature_planes = []
     for i,plane in enumerate(planes):
         # convert the sparse points to a unit cube
-        xy = normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane,range="0:1") # normalize to the range of (0, 1)
+        xy = normalize_coordinate(sparse_point_coords_norm.clone(), plane=plane,range=range) # normalize to the range of (0, 1)
         index = coordinate2index(xy, plane_resolution)
         if save_points:
             xys.append(xy)
@@ -561,9 +561,7 @@ def sample_planar_features(planar_features, xyz,aggregation="concat",params=None
         #crop_rotation= params["crop_rotation"]
         crop_size_m = params["crop_size_m"]
         xyz_norm = xyz - crop_center[:,None]
-        #xyz_norm = torch.bmm(xyz_norm, crop_rotation.transpose(1,2))
         xyz_norm = xyz_norm / crop_size_m[:,None]
-        #xyz_norm = xyz_norm * 2 
     else: 
         # assume xyz is between 0 and 1
         xyz_norm = ((xyz*2) - 1) # make uv between -1,1, for grid_sample

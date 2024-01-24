@@ -1,9 +1,9 @@
-offline_logging: True
+offline_logging: False
 
 improved_tsdf_sampling: True
 
 
-debug_scan: True
+debug_scan: False
 
 depth_guidance:
   pred_depth_dir:  "/scratch/students/2023-fall-acheche/data/scannet_simplerecon/outputs/converted_depth_est"
@@ -19,11 +19,11 @@ test_keyframes_file: "/scratch/students/2023-fall-acheche/ml-finerecon/keyframes
 # Parameters
 img_feature_dim: 20
 voxel_size: 0.02
-output_sample_rate: 1
+output_sample_rate: 2
 
 feature_volume:
-  enabled: True
-  n_voxels: [172, 172, 172]
+  enabled: False
+  n_voxels: [192, 192, 192]
   append_var: True
   use_2dcnn: False
 
@@ -44,7 +44,7 @@ improved_depth:
   n_samples: 1_000_000
   debug_save_meshes: False
   
-save_train_mesh: True
+  
 
 
 n_views_train: 20
@@ -57,7 +57,7 @@ finetune_steps: 10_000
 workers_train: 8
 workers_val: 8
 workers_predict: 8
-batch_size_per_device: 1
+batch_size_per_device: 2
 val_batch_size_per_device: 1
 
 

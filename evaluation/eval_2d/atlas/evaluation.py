@@ -73,6 +73,9 @@ def l1(tsdf_pred, tsdf_trgt):
 
     check_tsdf(tsdf_pred, tsdf_trgt)
     pred = tsdf_pred.tsdf_vol
+    ############
+    pred[pred.isnan()] = 1
+    ############
     trgt = tsdf_trgt.tsdf_vol.to(pred.device)
     mask = trgt<1  # ignore unobserved voxels
     return F.l1_loss(pred[mask], trgt[mask]).item()

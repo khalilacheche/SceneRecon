@@ -1,18 +1,30 @@
 ## Repo description
 
-main.py: main file to run the training and inference
-data.py: data loading and preprocessing (eval and train dataloaders, getting scans, etc.)
-eval_2d.py: script to perform 2d evaluation (wrapper script to call the evaluation code provided by the original authors of the paper)
-eval_3d.py: script to perform 3d evaluation (wrapper script to call the evaluation code provided by the original authors of the paper)
-utils.py: utility functions
-modules.py: implementation of the modules used in the model
-fine_recon.py: main file for the model
-collect_results.py: script to collect the results (json file for the 2d and 3d metrics for each scene) of the evaluation and save them in a csv file
-keyframes.json: json file containing the keyframes for each scene
-predict.sh: bash script to run the inference on all the scenes in the test set
-configs: folder containing the config files for the experiments
-evaluation: folder containing the source code for evaluation scripts
-debug_scripts: folder containing scripts used for debugging, used locally
+`main.py`: main file to run the training and inference
+
+`data.py`: data loading and preprocessing (eval and train dataloaders, getting scans, etc.)
+
+`eval_2d.py`: script to perform 2d evaluation (wrapper script to call the evaluation code provided by the original authors of the paper)
+
+`eval_3d.py`: script to perform 3d evaluation (wrapper script to call the evaluation code provided by the original authors of the paper)
+
+`utils.py`: utility functions
+
+`modules.py`: implementation of the modules used in the model
+
+`fine_recon.py`: main file for the model
+
+`collect_results.py`: script to collect the results (json file for the 2d and 3d metrics for each scene) of the evaluation and save them in a csv file
+
+`keyframes.json`: json file containing the keyframes for each scene
+
+`predict.sh`: bash script to run the inference on all the scenes in the test set
+
+`configs`: folder containing the config files for the experiments
+
+`evaluation`: folder containing the source code for evaluation scripts
+
+`debug_scripts`: folder containing scripts used for debugging, used locally
 
 
 ## Setup

@@ -171,7 +171,7 @@ def process(info_file, save_path, total_scenes_index, total_scenes_count):
     metrics = {**metrics_depth, **metrics_mesh, **metrics_tsdf}
     print(metrics)
 
-    rslt_file = os.path.join(save_path, '%s_metrics.json'%scene)
+    rslt_file = os.path.join(save_path, '%s_metrics_2d.json'%scene)
     json.dump(metrics, open(rslt_file, 'w'))
 
     return scene, metrics

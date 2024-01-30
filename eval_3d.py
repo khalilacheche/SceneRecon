@@ -1,5 +1,4 @@
 import evaluation.eval_3d.eval_3d as eval_3d
-#import evaluation.eval_2d.eval as eval_2d
 import argparse
 import os
 
@@ -8,9 +7,7 @@ import os
 def main(prediction_dir):
     
     metrics_3d = eval_3d.evaluate(prediction_dir,True)
-    #metrics_2d = eval_2d.evaluate(prediction_dir)
     print(metrics_3d)
-    #print(metrics_2d) 
 
 
 if __name__ == "__main__":

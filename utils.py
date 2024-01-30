@@ -18,6 +18,11 @@ def log_transform(tsdf):
 
 
 def points_to_csv(xyz,filename,valid=None):
+    """
+    xyz: B x N x 3
+    filename: str, path to save the points in csv format
+    valid: B x N, whether the point is valid
+    """
     B,N,_ = xyz.shape
     xyz = xyz.to("cpu").numpy()
     x = xyz[:,:,0].reshape(B,-1)
@@ -248,7 +253,6 @@ def sample_voxel_feats_(
         relative_dir = einops.rearrange(
             relative_dir, "B N dim XYZ -> B N XYZ dim"
         )
-    # maybe add dot product too (need to fold to B npoints XYZ then use bmm then unfold to B dim1 dim2 dim3 XYZ)
 
     ########
 
@@ -260,14 +264,14 @@ def sample_voxel_feats_(
     sdf = depths - z_depth[:, :, None]
     sdf.masked_fill_(
         ~depths_valid[:, :, None], invalid_fill_value
-    )  # might change to avoid biasing the network
+    )  # set invalid sdf to 0
 
     ########
 
     voxel_feats = torch.cat(
         [img_feats.float(), normals.float(), relative_dir.float(), sdf.float()],
         dim=2,
-    )
+    ) # B N C H W
     voxel_valid = torch.max(
         depths_valid, normals_valid
     )  # equivalent to logical or, while keeping differentiability
@@ -276,7 +280,6 @@ def sample_voxel_feats_(
     return voxel_feats, voxel_valid
 
 
-# copy from https://github.com/autonomousvision/convolutional_occupancy_networks/blob/838bea5b2f1314f2edbb68d05ebb0db49f1f3bd2/src/common.py
 def coordinate2index(x, reso, coord_type='2d'):
     ''' Normalize coordinate to [0, 1] for unit cube experiments.
         Corresponds to our 3D model
@@ -293,7 +296,6 @@ def coordinate2index(x, reso, coord_type='2d'):
     index = index[:, None, :]
     return index
 
-# copy from https://github.com/autonomousvision/convolutional_occupancy_networks/blob/838bea5b2f1314f2edbb68d05ebb0db49f1f3bd2/src/common.py
 def normalize_coordinate(p, plane='xz',range="-1:1"):
     ''' Normalize coordinate to [0, 1] for unit cube experiments
 
@@ -320,6 +322,9 @@ def normalize_coordinate(p, plane='xz',range="-1:1"):
     return xy_new
 
 def sample_image_feats(uv,imgs):
+    # batched image sampling, given the uv coordinates
+    # return shape is B Nv C Hin Win
+
     #uv represents the coordinates between -1 and 1 to sample the image features
     # img is the list of image to take from to cat, expected shape is B Nv C Hin Win 
     B, Nv, H, W , _ = uv.shape
@@ -340,20 +345,33 @@ def sample_image_feats(uv,imgs):
 
 
 
-def build_triplane_feature_encoder(params,cnns,device,append_var=False,plane_resolution=512,save_points=False,filename="points.csv"):
+def build_triplane_feature_encoder(params,cnns,device,append_var=False,plane_resolution=512,filename=None):
+    """
+    this function takes the images (depth, rgb, normal) and the poses and returns the features for each plane (xy, xz, yz)
+    This is done by projecting the point cloud (each pixel in depth image, along with their corresponding image features) to the 3 planes and passing them through the CNNs
+
+    params: dict with the following keys
+    cnns: list of 3 CNNs, one for each plane
+    device: torch.device
+    append_var: bool, whether to append the variance to the mean
+    plane_resolution: int, resolution of the plane
+    filename: str, path to save the points in csv format
+
+    """
+    save_points = filename is not None
     poses = params["poses"]
     depth_imgs = params["depth_imgs"]
     img_feats = params["img_feats"]
-    K_rgb = params["K_rgb"]
     K_depth = params["K_depth"]
     normal_imgs = params["normal_imgs"]
-    K_normal= params["K_normal"]
     crop_center= params["crop_center"]
     crop_rotation= params["crop_rotation"]
     crop_size_m= params["crop_size_m"]
-    
-    B,Nv,h_depth_imgs,w_depth_imgs = depth_imgs.shape
 
+
+
+    B,Nv,h_depth_imgs,w_depth_imgs = depth_imgs.shape
+    
     # create grids of the 20 depth map image
     # each grid should be (0, 0) to (w - 1, h - 1)
     xs = torch.linspace(0, w_depth_imgs-1, steps=w_depth_imgs)
@@ -433,11 +451,8 @@ def build_triplane_feature_encoder(params,cnns,device,append_var=False,plane_res
         if save_points:
             xys.append(xy)
             indexes.append(index)    
-
-        # FIXME: the center is not 0,0
         # scatter plane features from points
         fea_plane = fine_sparse_point_feats.new_zeros(B, c_dim, plane_resolution**2)
-        #c = c.permute(0, 2, 1) # B x 512 x T
         fea_plane = scatter_mean(fine_sparse_point_feats.permute(0,2,1), index, out=fea_plane) # B x 512 x reso^2
         fea_plane = fea_plane.reshape(B, c_dim, plane_resolution, plane_resolution) # sparce matrix (B x 512 x reso x reso)
         if append_var:
